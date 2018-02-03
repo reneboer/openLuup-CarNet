@@ -1,0 +1,98 @@
+<?xml version="1.0"?>
+<!-- 
+	openLuup "CarNet" Plug-in 
+	
+	Written by Rene Boer
+	
+	V1.0 3 February 2018
+	
+-->
+<implementation>
+	<settings>
+		<protocol>crlf</protocol>
+	</settings>
+	<files>L_CarNet1.lua</files>  
+	<startup>CarNetModule_Initialize</startup>
+	<actionList>
+		<action>
+			<name>startCharge</name>
+			<serviceId>urn:rboer-com:serviceId:CarNet1</serviceId>
+			<job>
+				myModule.StartAction('startCharge')
+				return 4, nil
+			</job>
+		</action>
+		<action>
+			<name>stopCharge</name>
+			<serviceId>urn:rboer-com:serviceId:CarNet1</serviceId>
+			<job>
+				myModule.StartAction('stopCharge')
+				return 4, nil
+			</job>
+		</action>
+		<action>
+			<name>startClimate</name>
+			<serviceId>urn:rboer-com:serviceId:CarNet1</serviceId>
+			<job>
+				myModule.StartAction('startClimate')
+				return 4, nil
+			</job>
+		</action>
+		<action>
+			<name>stopClimate</name>
+			<serviceId>urn:rboer-com:serviceId:CarNet1</serviceId>
+			<job>
+				myModule.StartAction('stopClimate')
+				return 4, nil
+			</job>
+		</action>
+		<action>
+			<name>startWindowMelt</name>
+			<serviceId>urn:rboer-com:serviceId:CarNet1</serviceId>
+			<job>
+				myModule.StartAction('startWindowMelt')
+				return 4, nil
+			</job>
+		</action>
+		<action>
+			<name>stopWindowMelt</name>
+			<serviceId>urn:rboer-com:serviceId:CarNet1</serviceId>
+			<job>
+				myModule.StartAction('stopWindowMelt')
+				return 4, nil
+			</job>
+		</action>
+		<action>
+			<name>getNewMessages</name>
+			<serviceId>urn:rboer-com:serviceId:CarNet1</serviceId>
+			<job>
+				myModule.Command('getNewMessages')
+				return 4, nil
+			</job>
+		</action>
+		<action>
+			<name>Reset</name>
+			<serviceId>urn:rboer-com:serviceId:CarNet1</serviceId>
+			<run>
+				myModule.Reset()
+				return 4, nil
+			</run>
+		</action>
+		<action>
+			<name>Login</name>
+			<serviceId>urn:rboer-com:serviceId:CarNet1</serviceId>
+			<job>
+				myModule.Login()
+				return 4, nil
+			</job>
+		</action>
+		<action>
+			<name>Poll</name>
+			<serviceId>urn:rboer-com:serviceId:CarNet1</serviceId>
+			<job>
+				myModule.Poll()
+				return 4, nil
+			</job>
+		</action>
+	</actionList>
+</implementation>
