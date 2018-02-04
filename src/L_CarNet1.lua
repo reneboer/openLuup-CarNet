@@ -2,7 +2,7 @@
 	Module L_CarNet1.lua
 	
 	Written by R.Boer. 
-	V1.0, 3 February 2018
+	V1.1, 4 February 2018
 
 	This plug-in emulates a browser accessing the VolksWagen Carnet portal www.volkswagen-car-net.com.
 	A valid CarNet registration is required.
@@ -28,12 +28,13 @@ local pD = {
 	Description = 'VW CarNet',
 	onOpenLuup = false,
 	Plugin_Disabled = false,
-	LogLevel = 10
+	LogLevel = 10,
+	lastVsrReqStarted = 0
 }
 
 local actionStateMap = {
-	['startCharge'] 	= { var = 'Charge', succeed = 1, failed =0, msg = 'charging start' },
-	['stopCharge'] 		= { var = 'Charge', succeed = 0, failed = 1, msg = 'charging stop' },
+	['startCharge'] 	= { var = 'Charge', succeed = 1, failed =0, msg = 'charging start', emanager = true },
+	['stopCharge'] 		= { var = 'Charge', succeed = 0, failed = 1, msg = 'charging stop', emanager = true },
 	['startClimate'] 	= { var = 'Climate', succeed = 1, failed =0, msg = 'climatisation start' },
 	['stopClimate'] 	= { var = 'Climate', succeed = 0, failed = 1, msg = 'climatisation stop' },
 	['startWindowMelt'] = { var = 'WindowMelt', succeed = 1, failed = 0, msg = 'window heating start' },
@@ -927,6 +928,16 @@ function CarNet_VariableChanged(lul_device, lul_service, lul_variable, lul_value
 		log.Debug("resetting CarNet...")
 		myModule.Reset()
 		log.Debug("resetting CarNet done.")
+	elseif (strVariable == 'LogLevel') then	
+		-- Set log level and debug flag if needed
+		local lev = tonumber(strNewVal, 10) or '10'
+		if lev > 10 then
+			pD.Debug = true
+			pD.LogLevel = 10
+		else
+			pD.Debug = false
+			pD.LogLevel = lev
+		end
 	end
 end
 
@@ -934,10 +945,10 @@ end
 function CarNet_UpdateStatus(request)
 	local result = true
 	log.Debug("CarNet_UpdateStatus, enter for " .. request)
-	var.Set('DisplayLine2', 'Refreshing status...', pD.SIDS.ALTUI)
 	-- After 24 hrs we do a getFullyLoadedCars command again
 	local lfp = os.time() - var.GetNumber('LastFLCPoll')
 	if request == 'loop' and lfp >  86400 then
+		var.Set('DisplayLine2', 'Refreshing status...', pD.SIDS.ALTUI)
 		-- Get high level car end CatNet subscription details, run this once a day
 		cde, res = myModule.Command('getFullyLoadedCars')
 		if cde == 200 then
@@ -958,6 +969,12 @@ function CarNet_UpdateStatus(request)
 			result = false
 		end
 	elseif request == 'loop' then
+		-- See if we have a pending request that started less than five minutes ago. Do not start a second one.
+		if (os.time() - pD.lastVsrReqStarted) < 300 then
+			log.Debug("CarNet_UpdateStatus, we have a double request within five minutes. Not starting a new.")
+			return false
+		end
+		var.Set('DisplayLine2', 'Refreshing status...', pD.SIDS.ALTUI)
 		local pol = var.Get("PollSettings")
 		local cs = var.GetNumber("ChargeStatus")
 		local cls= var.GetNumber("ClimateStatus")
@@ -999,6 +1016,7 @@ function CarNet_UpdateStatus(request)
 		luup.call_delay("CarNet_UpdateStatus", next_pol * 60, 'loop') end
 
 		-- Send update request to car, then wait 30 seconds to see if we have a result
+		pD.lastVsrReqStarted = os.time()
 		local cde, res = myModule.Command('getRequestVsr')
 		if cde == 200 then
 			log.Debug('getRequestVsr result : '..res)
@@ -1059,6 +1077,12 @@ function CarNet_UpdateStatus(request)
 						var.Set('StatusText','Update Car Status complete.')
 						local pc = var.GetNumber("PollOk", pD.SIDS.ZW) + 1
 						var.Set("PollOk", pc, pD.SIDS.ZW)
+						pD.lastVsrReqStarted = 0
+					else
+						-- Late/rogue getVsr response without status
+						var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
+						var.Set('StatusText','Update Car Status finished.')
+						pD.lastVsrReqStarted = 0
 					end	
 				else
 					log.Debug('getVsr failed result : '..res)
@@ -1097,7 +1121,19 @@ function CarNet_StartAction(request)
 						var.Set(as.var..'Message', 'Succeeded.')
 						var.Set('StatusText','Start Action, '..as.msg..' succeeded.')
 						var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
-						myModule.Poll()
+						-- Request eManager status if required
+						if as.emanager then
+							local cde, res = myModule.Command('getEManager')
+							if cde == 200 then
+								log.Debug('getEManager result : '..res)
+								local rjs = json.decode(res)
+								if rjs.errorCode == "0" then
+									myModule.UpdateCarEManager(rjs)
+								end
+							else
+								log.Debug('getEManager failed result : '..res)
+							end
+						end
 					else
 						log.Debug('Request '..ts..' not defined in actionStateMap.')
 					end
@@ -1113,7 +1149,6 @@ function CarNet_StartAction(request)
 						var.Set(as.var..'Status', as.failed)
 						var.Set(as.var..'Message', 'Failed: '..nt.errorTitle)
 						var.Set('StatusText','Start Action, '..as.msg..' failed.')
-						myModule.Poll()
 					else
 						log.Debug('Request '..ts..' not defined in actionStateMap.')
 					end
@@ -1225,6 +1260,7 @@ function CarNetModule_Initialize()
 --		pD.Plugin_Disabled = true
 --			var.Set("LinkStatus", "Plug-in disabled")
 		-- Now we are done. Mark device as disabled
+		var.Set("DisplayLine2","Plug-in disabled", pD.SIDS.ALTUI)
 		luup.set_failure(0, pD.DEV)
 		return true, "Plug-in Disabled.", pD.Description
 	end	
@@ -1239,6 +1275,7 @@ function CarNetModule_Initialize()
 	luup.variable_watch('CarNet_VariableChanged', pD.SIDS.MODULE, "Email", pD.DEV)
 	luup.variable_watch('CarNet_VariableChanged', pD.SIDS.MODULE, "Password", pD.DEV)
 	luup.variable_watch('CarNet_VariableChanged', pD.SIDS.MODULE, "Language", pD.DEV)
+	luup.variable_watch('CarNet_VariableChanged', pD.SIDS.MODULE, "LogLevel", pD.DEV)
 		
 	-- Start polling loop
 	luup.call_delay("CarNet_UpdateStatus", 36, "loop")
