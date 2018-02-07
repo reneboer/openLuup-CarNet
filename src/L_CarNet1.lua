@@ -2,7 +2,7 @@
 	Module L_CarNet1.lua
 	
 	Written by R.Boer. 
-	V1.1, 4 February 2018
+	V1.2, 7 February 2018
 
 	This plug-in emulates a browser accessing the VolksWagen Carnet portal www.volkswagen-car-net.com.
 	A valid CarNet registration is required.
@@ -15,7 +15,7 @@ local json 		= require("dkjson")
 local https     = require("ssl.https")
 
 local pD = {
-	Version = '1.0',
+	Version = '1.2',
 	Debug = true,
 	SIDS = { 
 		MODULE = 'urn:rboer-com:serviceId:CarNet1',
@@ -558,6 +558,7 @@ function CarNetModule()
 	local function _init()
 	
 		-- Create variables we will need from get-go
+		var.Set("Version", pD.Version)
 		var.Default("Email")
 		var.Default("Password")
 		var.Default("LogLevel", pD.LogLevel)
@@ -591,6 +592,7 @@ function CarNetModule()
 		var.Default("FastPollLocations")
 		var.Default("AtLocationRadius", 0.5)
 		var.Default("PowerSupplyConnected")
+		var.Default("NoPollWindow","23:30-7:30")
 		var.Default("IconSet",0)
 		pD.LogLevel = var.GetNumber("LogLevel")
 		var.Set('DisplayLine2', '')
@@ -971,45 +973,66 @@ function CarNet_UpdateStatus(request, noSched)
 		luup.call_delay("CarNet_UpdateStatus", 10, 'loop')
 	elseif request == 'loop' then
 		-- Schedule next update request unless we should not (for ad-hoc Poll)
+		-- Times are for Active, Home Idle, Away Idle, FastPoll location
+		-- Unless in No Poll time window, then do not start to end of window again.
 		if (not noSched) then
-			local pol = var.Get("PollSettings")
-			local cs = var.GetNumber("ChargeStatus")
-			local cls= var.GetNumber("ClimateStatus")
-			local ws = var.GetNumber("WindowMeltStatus")
-			local pol_t = {}
-			local next_pol = 60
-			string.gsub(pol..",","(.-),", function(c) pol_t[#pol_t+1] = c end)
-			if #pol_t > 2 then 
-				-- If an action is active, use second poll time
-				if cs == 1 or cls == 1 or sw == 1 then 
-					next_pol = pol_t[1]
-				else
-					-- If not active, see if car is in atHome range or not
-					if var.GetNumber('LocationHome') == 1 then
-						next_pol = pol_t[2]
-					else	
-						next_pol = pol_t[3]
-						-- See if we are at a fast poll location
-						local fpl = var.Get('FastPollLocations')
-						local lat = var.Set('Latitude')
-						local lng = var.Set('Longitude')
-						if fpl ~= '' and lat ~= '' and lng ~= '' then
-							local locs_t = {}
-							string.gsub(fpl..";","(.-);", function(c) locs_t[#locs_t+1] = c end)
-							for i = 1, #locs_t do
-								local lc_t = {}
-								string.gsub(locs_t[i]..",","(.-),", function(c) lc_t[#lc_t+1] = c end)
-								if _distance(lc_t[1], lc_t[2], lat, lng) < radius then
-									next_pol = pol_t[4]
-									break
+			local next_pol = 0
+			local noptw = var.Get("NoPollWindow")
+			if noptw ~= '' then
+				local st, et = string.match(noptw,"(.-)\-(.+)")
+				local hS, mS = string.match(st,"(%d+):(%d+)")
+				local mStart = (hS * 60) + mS
+				local tNow = os.date("*t")
+				local mNow = (tNow.hour * 60) + tNow.min
+				if (mNow >= mStart) then
+					-- After time, calculate next start
+					tNow.day =  tNow.day+1
+					local hS, mS = string.match(et,"(%d+):(%d+)")
+					tNow.hour = hS
+					tNow.min = mS
+					tNow.sec=0
+					next_pol = os.time(tNow) - os.time()
+				end
+			end	
+			if next_pol == 0 then	
+				local pol = var.Get("PollSettings")
+				local cs = var.GetNumber("ChargeStatus")
+				local cls= var.GetNumber("ClimateStatus")
+				local ws = var.GetNumber("WindowMeltStatus")
+				local pol_t = {}
+				string.gsub(pol..",","(.-),", function(c) pol_t[#pol_t+1] = c end)
+				if #pol_t == 4 then 
+					-- If an action is active, use second poll time
+					if cs == 1 or cls == 1 or sw == 1 then 
+						next_pol = pol_t[1]
+					else
+						-- If not active, see if car is in atHome range or not
+						if var.GetNumber('LocationHome') == 1 then
+							next_pol = pol_t[2]
+						else	
+							next_pol = pol_t[3]
+							-- See if we are at a fast poll location
+							local fpl = var.Get('FastPollLocations')
+							local lat = var.Set('Latitude')
+							local lng = var.Set('Longitude')
+							if fpl ~= '' and lat ~= '' and lng ~= '' then
+								local locs_t = {}
+								string.gsub(fpl..";","(.-);", function(c) locs_t[#locs_t+1] = c end)
+								for i = 1, #locs_t do
+									local lc_lat, lc_lng = string.match(locs_t[i],"(.-),(.+)")
+									if _distance(lc_lat, lc_lng, lat, lng) < radius then
+										next_pol = pol_t[4]
+										break
+									end
 								end
 							end
 						end
 					end
+					next_pol = next_pol * 60  -- Minutes to seconds
 				end
 			end
-			if (next_pol == 0) then next_poll = 60 end
-			luup.call_delay("CarNet_UpdateStatus", next_pol * 60, 'loop') 
+			if (next_pol == 0) then next_pol = 3600 end
+			luup.call_delay("CarNet_UpdateStatus", next_pol, 'loop') 
 		end
 		
 		-- See if we have a pending request that started less than five minutes ago. Do not start a second one.

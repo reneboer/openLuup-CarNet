@@ -1,7 +1,7 @@
 //# sourceURL=J_CarNet1.js
 // openLuup "CarNet" Plug-in
 // Written by R.Boer. 
-// V1.0 3 February 2018
+// V1.2 7 February 2018
 //
 var CarNet = (function (api) {
 
@@ -40,7 +40,8 @@ var CarNet = (function (api) {
 				htmlAddPulldown(deviceID, 'Poll Interval; Home Idle', 'PI1', pollIntervals)+
 				htmlAddPulldown(deviceID, 'Poll Interval; Away Idle', 'PI2', pollIntervals)+
 				htmlAddPulldown(deviceID, 'Poll Interval; Fast Locations', 'PI3', pollIntervals)+
-				htmlAddInput(deviceID, 'Fast Poll Locations (in JSON frmt)', 30, 'FastPollLocations')+ 
+				htmlAddInput(deviceID, 'Fast Poll Locations (lat,lng;lat,lng)', 30, 'FastPollLocations')+ 
+				htmlAddInput(deviceID, 'No Poll time window (hh:mm-hh:mm)', 30, 'NoPollWindow')+ 
 				htmlAddPulldown(deviceID, 'Log level', 'LogLevel', logLevel);
 			}
 			api.setCpanelContent(panelHtml);
