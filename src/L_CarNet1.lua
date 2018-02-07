@@ -102,7 +102,7 @@ local function varAPI()
 	
 	-- Get an attribute value, try to return as number value if applicable
 	local function _getattr(name, device)
-		local value = luup.attr_get("disabled", tonumber(device or def_dev))
+		local value = luup.attr_get(name, tonumber(device or def_dev))
 		local nv = tonumber(value,10)
 		return (nv or value)
 	end
@@ -592,8 +592,8 @@ function CarNetModule()
 		var.Default("AtLocationRadius", 0.5)
 		var.Default("PowerSupplyConnected")
 		var.Default("IconSet",0)
-		
-
+		pD.LogLevel = var.GetNumber("LogLevel")
+		var.Set('DisplayLine2', '')
 		return true
 	end
 
@@ -745,7 +745,7 @@ function CarNetModule()
 					var.Set('LocksStatus', txt..'unlocked')
 					var.Set('IconSet',3)
 				else	
-					var.Set('LocksStatus','All locked')
+					var.Set('LocksStatus','Locked')
 				end
 			end	
 			-- Get mileage and refresh time details
@@ -767,9 +767,10 @@ function CarNetModule()
 	-- We have an updated car location
 	local function _update_car_location(rjs)
 		if rjs.position then
-			local lat = rjs.position.lat 
-			local lng = rjs.position.lng
-			var.Set('Location', 'Lat : '..(lat or '?')..', Long : '..(lng or '?'))
+			local lat = (rjs.position.lat or 0)
+			local lng = (rjs.position.lng or 0)
+			var.Set('Latitude', lat)
+			var.Set('Longitude', lng)
 			-- Compare to home location and set/clear at home flag when within 500 m
 			lat = tonumber(lat) or luup.latitude
 			lng = tonumber(lng) or luup.longitude
@@ -894,7 +895,7 @@ function CarNetModule()
 	-- Trigger an update of the car status by sending RequestVsr now
 	local function _poll()
 		log.Debug("Poll, enter")
-		CarNet_UpdateStatus('loop')
+		CarNet_UpdateStatus('loop', false)
 	end
 	
 	local function _start_action(request)
@@ -942,12 +943,12 @@ function CarNet_VariableChanged(lul_device, lul_service, lul_variable, lul_value
 end
 
 -- Global routine for polling car status. First send RequestVsr and then wait for updated status response.
-function CarNet_UpdateStatus(request)
+function CarNet_UpdateStatus(request, noSched)
 	local result = true
 	log.Debug("CarNet_UpdateStatus, enter for " .. request)
 	-- After 24 hrs we do a getFullyLoadedCars command again
 	local lfp = os.time() - var.GetNumber('LastFLCPoll')
-	if request == 'loop' and lfp >  86400 then
+	if request == 'loop' and lfp >  86400 and (not noSched) then
 		var.Set('DisplayLine2', 'Refreshing status...', pD.SIDS.ALTUI)
 		-- Get high level car end CatNet subscription details, run this once a day
 		cde, res = myModule.Command('getFullyLoadedCars')
@@ -957,64 +958,67 @@ function CarNet_UpdateStatus(request)
 			if rjs.errorCode == "0" then
 				if myModule.UpdateCarDetails(rjs) then 
 					var.Set('LastFLCPoll', os.time())
-			
-					-- Next update car details in five seconds
-					luup.call_delay("CarNet_UpdateStatus", 5, 'loop')
 				else
 					log.Log('getFullyLoadedCars failed reading data : '..res,3)
 				end
 			end
 		else
+			var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
 			log.Log('getFullyLoadedCars failed result : '..res)
 			result = false
 		end
+		-- Next update car details in a bit
+		luup.call_delay("CarNet_UpdateStatus", 10, 'loop')
 	elseif request == 'loop' then
+		-- Schedule next update request unless we should not (for ad-hoc Poll)
+		if (not noSched) then
+			local pol = var.Get("PollSettings")
+			local cs = var.GetNumber("ChargeStatus")
+			local cls= var.GetNumber("ClimateStatus")
+			local ws = var.GetNumber("WindowMeltStatus")
+			local pol_t = {}
+			local next_pol = 60
+			string.gsub(pol..",","(.-),", function(c) pol_t[#pol_t+1] = c end)
+			if #pol_t > 2 then 
+				-- If an action is active, use second poll time
+				if cs == 1 or cls == 1 or sw == 1 then 
+					next_pol = pol_t[1]
+				else
+					-- If not active, see if car is in atHome range or not
+					if var.GetNumber('LocationHome') == 1 then
+						next_pol = pol_t[2]
+					else	
+						next_pol = pol_t[3]
+						-- See if we are at a fast poll location
+						local fpl = var.Get('FastPollLocations')
+						local lat = var.Set('Latitude')
+						local lng = var.Set('Longitude')
+						if fpl ~= '' and lat ~= '' and lng ~= '' then
+							local locs_t = {}
+							string.gsub(fpl..";","(.-);", function(c) locs_t[#locs_t+1] = c end)
+							for i = 1, #locs_t do
+								local lc_t = {}
+								string.gsub(locs_t[i]..",","(.-),", function(c) lc_t[#lc_t+1] = c end)
+								if _distance(lc_t[1], lc_t[2], lat, lng) < radius then
+									next_pol = pol_t[4]
+									break
+								end
+							end
+						end
+					end
+				end
+			end
+			if (next_pol == 0) then next_poll = 60 end
+			luup.call_delay("CarNet_UpdateStatus", next_pol * 60, 'loop') 
+		end
+		
 		-- See if we have a pending request that started less than five minutes ago. Do not start a second one.
 		if (os.time() - pD.lastVsrReqStarted) < 300 then
 			log.Debug("CarNet_UpdateStatus, we have a double request within five minutes. Not starting a new.")
 			return false
 		end
 		var.Set('DisplayLine2', 'Refreshing status...', pD.SIDS.ALTUI)
-		local pol = var.Get("PollSettings")
-		local cs = var.GetNumber("ChargeStatus")
-		local cls= var.GetNumber("ClimateStatus")
-		local ws = var.GetNumber("WindowMeltStatus")
-		local pol_t = {}
-		local next_pol = 60
-		string.gsub(pol..",","(.-),", function(c) pol_t[#pol_t+1] = c end)
-		if #pol_t > 2 then 
-			-- If an action is active, use second poll time
-			if cs == 1 or cls == 1 or sw == 1 then 
-				next_pol = pol_t[1]
-			else
-			-- If not active, see if car is in atHome range or not
-			if var.GetNumber('LocationHome') == 1 then
-				next_pol = pol_t[2]
-			else	
-				next_pol = pol_t[3]
-				-- See if we are at a fast poll location
-				local fpl = json.decode(var.Get('FastPollLocations'))
-				if fpl then
-					if #fpl == 0 then
-						if _distance(fpl.lat, fpl.lng, luup.latitude, luup.longitude) < radius then
-							next_pol = pol_t[4]
-						end
-					else
-						for k,v in pairs(fpl) do
-							if _distance(v.lat, v.lng, luup.latitude, luup.longitude) < radius then
-								next_pol = pol_t[4]
-								break
-							end
-						end
-					end
-				end
-			end
-		end
-	
-		-- Schedule next update request
-		if (next_pol == 0) then next_poll = 60 end
-		luup.call_delay("CarNet_UpdateStatus", next_pol * 60, 'loop') end
-
+		
 		-- Send update request to car, then wait 30 seconds to see if we have a result
 		pD.lastVsrReqStarted = os.time()
 		local cde, res = myModule.Command('getRequestVsr')
@@ -1025,10 +1029,12 @@ function CarNet_UpdateStatus(request)
 				var.Set('StatusText','Update Car Status in progress....')
 				luup.call_delay("CarNet_UpdateStatus", 30, 'poll0') 
 			else
+				var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
 				var.Set('StatusText','Update Car Status request failed.')
 				result = false
 			end
 		else
+			var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
 			var.Set('StatusText','Update Car Status request failed.')
 			result = false
 		end
@@ -1101,6 +1107,7 @@ function CarNet_UpdateStatus(request)
 	if not result then
 		local pc = var.GetNumber("PollNoReply", pD.SIDS.ZW) + 1
 		var.Set("PollNoReply", pc, pD.SIDS.ZW)
+		var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
 	end
 	log.Debug("CarNet_UpdateStatus, leave")
 end
@@ -1131,6 +1138,7 @@ function CarNet_StartAction(request)
 									myModule.UpdateCarEManager(rjs)
 								end
 							else
+								var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
 								log.Debug('getEManager failed result : '..res)
 							end
 						end
@@ -1188,10 +1196,12 @@ function CarNet_StartAction(request)
 					end	
 				end	
 			else
+				var.Set('DisplayLine2', 'Failed', pD.SIDS.ALTUI)
 				var.Set(as.var..'Status', as.failed) 
 				var.Set('StatusText','Start Action, '..as.msg..' failed.')
 			end	
 		else	
+			var.Set('DisplayLine2', 'Failed', pD.SIDS.ALTUI)
 			var.Set(as.var..'Status', as.failed)
 			var.Set('StatusText','Start Action, '..as.msg..' failed.')
 		end	
@@ -1216,14 +1226,17 @@ function CarNet_StartAction(request)
 					end	
 					var.Set('StatusText','Update Action Status complete.')
 				else
+					var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
 					log.Debug('getNotifications failed result : '..res)
 				end	
 			else
+				var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
 				log.Debug('getNotifications failed result : '..res)
 			end
 		else
 			log.Log('getNotifications did not return a SUCCEEDED within expected time window.',5)
 			var.Set('StatusText','Update Action Status timed out.')
+			var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
 		end
 	else	
 		log.Debug("CarNet_StartAction, unknown request : "..(request or ''))

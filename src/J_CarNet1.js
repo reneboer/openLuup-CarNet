@@ -60,7 +60,8 @@ var CarNet = (function (api) {
 				panelHtml += '<br>Plugin is disabled in Attributes.';
 			} else {	
 				var cn = varGet(deviceID, 'CarName');
-				var cl = varGet(deviceID, 'Location');
+				var lat = Number.parseFloat(varGet(deviceID, 'Latitude')).toFixed(4);
+				var lng = Number.parseFloat(varGet(deviceID, 'Longitude')).toFixed(4);
 				var clh = varGet(deviceID, 'LocationHome');
 				var ppls = varGet(deviceID, 'PowerPlugLockState');
 				var pps = varGet(deviceID, 'PowerPlugState');
@@ -91,7 +92,7 @@ var CarNet = (function (api) {
 					'<tr><td> </td><td> </td><td></td></tr>'+
 					'<tr><td>Milage </td><td>'+mlg+' Km</td></tr>'+
 					'<tr><td> </td><td> </td><td></td></tr>'+
-					'<tr><td>Car location </td><td>'+(clh==='1'?'Home':'Away')+'</td><td>'+cl+'</td></tr>'+
+					'<tr><td>Car location </td><td>'+(clh==='1'?'Home':'Away')+'</td><td>Latitude : '+lat+', Longitude : '+lng+'</td></tr>'+
 					'<tr><td>Power Status </td><td colspan="2">'+psm+'</td></tr>'+
 					'<tr><td> </td><td> </td><td></td></tr>'+
 					'<tr><td>Locks Status </td><td colspan="2">'+lcks+'</td></tr>'+
@@ -139,7 +140,7 @@ var CarNet = (function (api) {
 		var html = '<div class="clearfix labelInputContainer">'+
 					'<div class="pull-left inputLabel" style="width:280px;">'+lb+'</div>'+
 					'<div class="pull-left">'+
-						'<input class="customInput" '+typ+' size="'+si+'" id="'+moduleName+vr+di+'" value="'+val+'" onChange="'+moduleName+'.updateVariable(\''+vr+'\',this.value)">'+
+						'<input class="customInput altui-ui-input form-control" '+typ+' size="'+si+'" id="'+moduleName+vr+di+'" value="'+val+'" onChange="'+moduleName+'.updateVariable(\''+vr+'\',this.value)">'+
 					'</div>'+
 				   '</div>';
 		if (vr.toLowerCase() == 'password') {
@@ -174,7 +175,7 @@ var CarNet = (function (api) {
 			var html = '<div class="clearfix labelInputContainer">'+
 				'<div class="pull-left inputLabel" style="width:280px;">'+lb+'</div>'+
 				'<div class="pull-left customSelectBoxContainer">'+
-				'<select id="'+moduleName+vr+di+'" onChange="'+moduleName+'.updateVariable(\''+vr+'\',this.value)" class="customSelectBox">';
+				'<select id="'+moduleName+vr+di+'" onChange="'+moduleName+'.updateVariable(\''+vr+'\',this.value)" class="customSelectBox form-control">';
 			for(var i=0;i<values.length;i++){
 				html += '<option value="'+values[i].value+'" '+((values[i].value==selVal)?'selected':'')+'>'+values[i].label+'</option>';
 			}
