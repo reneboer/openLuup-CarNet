@@ -2,7 +2,7 @@
 	Module L_CarNet1.lua
 	
 	Written by R.Boer. 
-	V1.2, 7 February 2018
+	V1.2, 8 February 2018
 
 	This plug-in emulates a browser accessing the VolksWagen Carnet portal www.volkswagen-car-net.com.
 	A valid CarNet registration is required.
@@ -33,8 +33,8 @@ local pD = {
 }
 
 local actionStateMap = {
-	['startCharge'] 	= { var = 'Charge', succeed = 1, failed =0, msg = 'charging start', emanager = true },
-	['stopCharge'] 		= { var = 'Charge', succeed = 0, failed = 1, msg = 'charging stop', emanager = true },
+	['startCharge'] 	= { var = 'Charge', succeed = 1, failed =0, msg = 'charging start' },
+	['stopCharge'] 		= { var = 'Charge', succeed = 0, failed = 1, msg = 'charging stop' },
 	['startClimate'] 	= { var = 'Climate', succeed = 1, failed =0, msg = 'climatisation start' },
 	['stopClimate'] 	= { var = 'Climate', succeed = 0, failed = 1, msg = 'climatisation stop' },
 	['startWindowMelt'] = { var = 'WindowMelt', succeed = 1, failed = 0, msg = 'window heating start' },
@@ -594,7 +594,6 @@ function CarNetModule()
 		var.Default("PowerSupplyConnected")
 		var.Default("NoPollWindow","23:30-7:30")
 		var.Default("IconSet",0)
-		pD.LogLevel = var.GetNumber("LogLevel")
 		var.Set('DisplayLine2', '')
 		return true
 	end
@@ -788,8 +787,9 @@ function CarNetModule()
 		end
 	end
 	
-	-- We have updated e-manager data
+	-- We have updated e-manager data, return any remaining charge or climate time.
 	local function _update_car_emanager(rjs)
+		local rem_time = 0
 		if rjs.EManager then
 			local rbcs = rjs.EManager.rbc.status
 			local icon = 0
@@ -806,6 +806,7 @@ function CarNetModule()
 			-- Get charge status
 			if rbcs.chargingState then var.Set("ChargeStatus", ((rbcs.chargingState == 'CHARGING' and '1') or '0')) end
 			if rbcs.chargingRemaningHour and rbcs.chargingRemaningMinute then 
+				rem_time = tonumber(rbcs.chargingRemaningHour) + tonumber(rbcs.chargingRemaningMinute)
 				ct = rbcs.chargingRemaningHour ..':'.. rbcs.chargingRemaningMinute
 				var.Set("RemainingChargeTime", ct) 
 			end
@@ -838,6 +839,7 @@ function CarNetModule()
 			end
 			if rpcs.climatisationRemaningTime then 
 				tr = rpcs.climatisationRemaningTime
+				if rem_time == 0 then rem_time = tonumber(tr) end
 				var.Set("ClimateRemainingTime", tr) 
 			end
 			if wh == '1' then
@@ -855,10 +857,8 @@ function CarNetModule()
 			end	
 			if wh == '0' then var.Set('WindowMeltMessage', '') end
 			var.Set('IconSet',icon)
-			return true
-		else
-			return false
 		end
+		return rem_time
 	end
 
 	-- We have updated car details data
@@ -894,6 +894,76 @@ function CarNetModule()
 		end
 	end
 	
+	-- Times are for Active, Home Idle, Away Idle, FastPoll location
+	-- Unless in No Poll time window, then do not start to end of window again.
+	local function _calculate_next_poll()
+		local next_pol = 0
+		local noptw = var.Get("NoPollWindow")
+		if noptw ~= '' then
+			local st, et = string.match(noptw,"(.-)\-(.+)")
+			local hS, mS = string.match(st,"(%d+):(%d+)")
+			local mStart = (hS * 60) + mS
+			local hE, mE = string.match(et,"(%d+):(%d+)")
+			local mEnd = (hE * 60) + mE
+			local tNow = os.date("*t")
+			local mNow = (tNow.hour * 60) + tNow.min
+			local bMatch = false
+			if mEnd >= mStart then
+				bMatch = ((mNow >= mStart) and (mNow <= mEnd))
+			else
+				bMatch = ((mNow >= mStart) or (mNow <= mEnd))
+			end
+			if bMatch then
+				-- After time, calculate next start
+				tNow.day =  tNow.day+1
+				tNow.hour = hE
+				tNow.min = mE
+				tNow.sec=0
+				next_pol = os.time(tNow) - os.time()
+			end
+		end	
+		if next_pol == 0 then	
+			local pol = var.Get("PollSettings")
+--			local cs = var.GetNumber("ChargeStatus")
+--			local cls= var.GetNumber("ClimateStatus")
+--			local ws = var.GetNumber("WindowMeltStatus")
+			local pol_t = {}
+			string.gsub(pol..",","(.-),", function(c) pol_t[#pol_t+1] = c end)
+			if #pol_t == 4 then 
+				-- If an action is active, use first poll time
+--				if cs == 1 or cls == 1 or sw == 1 then 
+--					next_pol = pol_t[1]
+--				else
+					-- If not active, see if car is in atHome range or not
+					if var.GetNumber('LocationHome') == 1 then
+						next_pol = pol_t[2]
+					else	
+						next_pol = pol_t[3]
+						-- See if we are at a fast poll location
+						local fpl = var.Get('FastPollLocations')
+						local lat = var.GetNumber('Latitude')
+						local lng = var.GetNumber('Longitude')
+						if fpl ~= '' and lat ~= 0 and lng ~= 0 then
+							local locs_t = {}
+							string.gsub(fpl..";","(.-);", function(c) locs_t[#locs_t+1] = c end)
+							for i = 1, #locs_t do
+								local lc_lat, lc_lng = string.match(locs_t[i],"(.-),(.+)")
+								if _distance(lc_lat, lc_lng, lat, lng) < radius then
+									next_pol = pol_t[4]
+									break
+								end
+							end
+						end
+					end
+--				end
+				next_pol = next_pol * 60  -- Minutes to seconds
+			end
+		end
+
+		if (next_pol == 0) then next_pol = 3600 end
+		return next_pol
+	end
+			
 	-- Trigger an update of the car status by sending RequestVsr now
 	local function _poll()
 		log.Debug("Poll, enter")
@@ -914,6 +984,7 @@ function CarNetModule()
 		UpdateCarStatus = _update_car_status,
 		UpdateCarLocation = _update_car_location,
 		UpdateCarEManager = _update_car_emanager,
+		CalculateNextPoll = _calculate_next_poll,
 		CalculateDistance = _distance,
 		Initialize = _init
 	}
@@ -973,65 +1044,8 @@ function CarNet_UpdateStatus(request, noSched)
 		luup.call_delay("CarNet_UpdateStatus", 10, 'loop')
 	elseif request == 'loop' then
 		-- Schedule next update request unless we should not (for ad-hoc Poll)
-		-- Times are for Active, Home Idle, Away Idle, FastPoll location
-		-- Unless in No Poll time window, then do not start to end of window again.
 		if (not noSched) then
-			local next_pol = 0
-			local noptw = var.Get("NoPollWindow")
-			if noptw ~= '' then
-				local st, et = string.match(noptw,"(.-)\-(.+)")
-				local hS, mS = string.match(st,"(%d+):(%d+)")
-				local mStart = (hS * 60) + mS
-				local tNow = os.date("*t")
-				local mNow = (tNow.hour * 60) + tNow.min
-				if (mNow >= mStart) then
-					-- After time, calculate next start
-					tNow.day =  tNow.day+1
-					local hS, mS = string.match(et,"(%d+):(%d+)")
-					tNow.hour = hS
-					tNow.min = mS
-					tNow.sec=0
-					next_pol = os.time(tNow) - os.time()
-				end
-			end	
-			if next_pol == 0 then	
-				local pol = var.Get("PollSettings")
-				local cs = var.GetNumber("ChargeStatus")
-				local cls= var.GetNumber("ClimateStatus")
-				local ws = var.GetNumber("WindowMeltStatus")
-				local pol_t = {}
-				string.gsub(pol..",","(.-),", function(c) pol_t[#pol_t+1] = c end)
-				if #pol_t == 4 then 
-					-- If an action is active, use second poll time
-					if cs == 1 or cls == 1 or sw == 1 then 
-						next_pol = pol_t[1]
-					else
-						-- If not active, see if car is in atHome range or not
-						if var.GetNumber('LocationHome') == 1 then
-							next_pol = pol_t[2]
-						else	
-							next_pol = pol_t[3]
-							-- See if we are at a fast poll location
-							local fpl = var.Get('FastPollLocations')
-							local lat = var.Set('Latitude')
-							local lng = var.Set('Longitude')
-							if fpl ~= '' and lat ~= '' and lng ~= '' then
-								local locs_t = {}
-								string.gsub(fpl..";","(.-);", function(c) locs_t[#locs_t+1] = c end)
-								for i = 1, #locs_t do
-									local lc_lat, lc_lng = string.match(locs_t[i],"(.-),(.+)")
-									if _distance(lc_lat, lc_lng, lat, lng) < radius then
-										next_pol = pol_t[4]
-										break
-									end
-								end
-							end
-						end
-					end
-					next_pol = next_pol * 60  -- Minutes to seconds
-				end
-			end
-			if (next_pol == 0) then next_pol = 3600 end
+			local next_pol = myModule.CalculateNextPoll()
 			luup.call_delay("CarNet_UpdateStatus", next_pol, 'loop') 
 		end
 		
@@ -1152,8 +1166,9 @@ function CarNet_StartAction(request)
 						var.Set('StatusText','Start Action, '..as.msg..' succeeded.')
 						var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
 						-- Request eManager status if required
-						if as.emanager then
-							local cde, res = myModule.Command('getEManager')
+--						if as.emanager then
+							CarNet_PollEManager()
+--[[							local cde, res = myModule.Command('getEManager')
 							if cde == 200 then
 								log.Debug('getEManager result : '..res)
 								local rjs = json.decode(res)
@@ -1164,7 +1179,8 @@ function CarNet_StartAction(request)
 								var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
 								log.Debug('getEManager failed result : '..res)
 							end
-						end
+]]							
+--						end
 					else
 						log.Debug('Request '..ts..' not defined in actionStateMap.')
 					end
@@ -1267,6 +1283,40 @@ function CarNet_StartAction(request)
 	log.Debug("CarNet_StartAction, leave")
 end
 
+-- Global routine for polling e-Manager status when activity is running 
+function CarNet_PollEManager()
+	log.Debug("CarNet_PollEManager, enter")
+	
+	-- See if request is one of the commands
+	local cde, res = myModule.Command('getEManager')
+	if cde == 200 then
+		log.Debug('getEManager result : '..res)
+		local rjs = json.decode(res)
+		if rjs.errorCode == "0" then
+			local rem_time = myModule.UpdateCarEManager(rjs)
+			local pol = var.Get("PollSettings")
+			local cs = var.GetNumber("ChargeStatus")
+			local cls= var.GetNumber("ClimateStatus")
+			local ws = var.GetNumber("WindowMeltStatus")
+			local pol_t = {}
+			string.gsub(pol..",","(.-),", function(c) pol_t[#pol_t+1] = c end)
+			if #pol_t == 4 then 
+				-- If an action is active and we have remaining time continue to poll
+				if cs == 1 or cls == 1 or sw == 1 then 
+					log.Debug('Schedule CarNet_PollEManager : '..tonumber(pol_t[1]) * 60)
+					luup.call_delay("CarNet_PollEManager", tonumber(pol_t[1]) * 60)
+				else	
+					var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
+				end
+			end
+		end
+	else
+		var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
+		log.Debug('getEManager failed result : '..res)
+	end
+	log.Debug("CarNet_PollEManager, leave")
+end
+
 -- Initialize plug-in
 function CarNetModule_Initialize()
 	pD.DEV = lul_device
@@ -1275,6 +1325,15 @@ function CarNetModule_Initialize()
 	log = logAPI()
 	var = varAPI()
 	var.Initialize(pD.SIDS.MODULE, pD.DEV)
+
+	local lev = var.GetNumber("LogLevel")
+	if lev > 10 then
+		pD.Debug = true
+		pD.LogLevel = 10
+	else
+		pD.Debug = false
+		pD.LogLevel = lev
+	end
 	log.Initialize(pD.Description, pD.LogLevel, pD.Debug)
 
 	log.Log("device #" .. pD.DEV .. " is initializing!",3)
