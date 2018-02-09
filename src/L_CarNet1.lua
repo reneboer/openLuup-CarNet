@@ -8,6 +8,7 @@
 	A valid CarNet registration is required.
 	
 	At this moment only openLuup is supported provided it has LuaSec 0.7 installed. With LuaSec 0.5 the portal login will fail.
+
 ]]
 
 local ltn12 	= require("ltn12")
@@ -16,7 +17,6 @@ local https     = require("ssl.https")
 
 local pD = {
 	Version = '1.2',
-	Debug = true,
 	SIDS = { 
 		MODULE = 'urn:rboer-com:serviceId:CarNet1',
 		ALTUI = 'urn:upnp-org:serviceId:altui1',
@@ -27,8 +27,6 @@ local pD = {
 	DEV = nil,
 	Description = 'VW CarNet',
 	onOpenLuup = false,
-	Plugin_Disabled = false,
-	LogLevel = 10,
 	lastVsrReqStarted = 0
 }
 
@@ -48,6 +46,19 @@ local actionTypeMap = {
 	['STOP_CLIMATISATION'] = 'stopClimate',
 	['START_WINDOW_HEATING'] = 'startWindowMelt',
 	['STOP_WINDOW_HEATING'] = 'stopWindowMelt'
+}
+
+-- Define message when condition is not true
+local messageMap = {
+	{var='ChargeStatus', val='0', msg='Charging On'},
+	{var='ClimateStatus', val='0', msg='Climatizing On'},
+	{var='WindowMeltStatus',val='0',msg='Window Melt On'},
+	{var='DoorsStatus',val='Closed',msg='Doors Open'},
+	{var='LocksStatus',val='Locked',msg='Doors Unlocked'},
+	{var='WindowsStatus',val='Closed',msg='Windows Open'},
+	{var='SunroofStatus',val='Closed',msg='Sunroof Open'},
+	{var='LightsStatus',val='Off',msg='Lights Open'},
+	{var='PackageServiceExpireInAmonth',val='0',msg='Subscription to Expire'}
 }
 
 local myCarNet
@@ -129,10 +140,19 @@ local def_level = 3
 local def_prefix = ''
 local def_debug = false
 
-	local function _init(prefix, level, deb)
-		def_level = level
+	local function _update(level)
+		if level > 10 then
+			def_debug = true
+			def_level = 10
+		else
+			def_debug = false
+			def_level = lev
+		end
+	end	
+
+	local function _init(prefix, level)
+		_update(level)
 		def_prefix = prefix
-		def_debug = deb
 	end	
 
 	local function _log(text, level) 
@@ -151,6 +171,7 @@ local def_debug = false
 	
 	return {
 		Initialize = _init,
+		Update = _update,
 		Log = _log,
 		Debug = _debug
 	}
@@ -567,13 +588,13 @@ function CarNetModule()
 		var.Default("SessionID")
 		var.Default("Language", "GB")
 		var.Default("PollSettings", '5,60,120,15') -- Active, Home Idle, Away Idle, FastPoll location
-		var.Default("LocationHome")
+		var.Default("LocationHome","0")
 		var.Default("CarName")
 		var.Default("PackageService")
 		var.Default("PackageServiceActDate")
 		var.Default("PackageServiceExpDate")
-		var.Default("PackageServiceExpired")
-		var.Default("PackageServiceExpireInAmonth")
+		var.Default("PackageServiceExpired","0")
+		var.Default("PackageServiceExpireInAmonth","0")
 		var.Default("LastFLCPoll", 0)
 		var.Default("ChargeStatus", "0")
 		var.Default("ClimateStatus", "0")
@@ -581,21 +602,38 @@ function CarNetModule()
 		var.Default("ChargeMessage")
 		var.Default("ClimateMessage")
 		var.Default("WindowMeltMessage")
-		var.Default("DoorsStatus")
-		var.Default("WindowsStatus")
-		var.Default("SunroofStatus")
-		var.Default("LightsStatus")
-		var.Default("HoodStatus")
+		var.Default("DoorsStatus","Closed")
+		var.Default("LocksStatus","Locked")
+		var.Default("WindowsStatus","Closed")
+		var.Default("SunroofStatus","Closed")
+		var.Default("LightsStatus","Off")
+		var.Default("HoodStatus","Closed")
 		var.Default("Mileage")
-		var.Default("Location")
-		var.Default("LocationHome")
+		var.Default("LocationHome", "0")
 		var.Default("FastPollLocations")
 		var.Default("AtLocationRadius", 0.5)
-		var.Default("PowerSupplyConnected")
+		var.Default("PowerSupplyConnected", "0")
 		var.Default("NoPollWindow","23:30-7:30")
 		var.Default("IconSet",0)
-		var.Set('DisplayLine2', '')
 		return true
+	end
+	
+	-- Set best status message
+	local function _set_status_message(proposed)
+		local msg = ''
+		if proposed then
+			msg = proposed
+		else	
+			-- Look for messages based on key status items
+			for k, msg_t in pairs(messageMap) do
+				local val = var.Get(msg_t.var)
+				if val ~= msg_t.val then
+					msg = msg_t.msg
+					break
+				end    
+			end
+		end
+		var.Set('DisplayLine2', msg, pD.SIDS.ALTUI)
 	end
 
 	-- Erase userURL and related values. This will fore a new login
@@ -912,10 +950,10 @@ function CarNetModule()
 				bMatch = ((mNow >= mStart) and (mNow <= mEnd))
 			else
 				bMatch = ((mNow >= mStart) or (mNow <= mEnd))
+				if (mNow ~= 0) and (mNow >= mStart) then  tNow.day =  tNow.day + 1 end
 			end
 			if bMatch then
-				-- After time, calculate next start
-				tNow.day =  tNow.day+1
+				-- In window, next start is end time
 				tNow.hour = hE
 				tNow.min = mE
 				tNow.sec=0
@@ -924,38 +962,30 @@ function CarNetModule()
 		end	
 		if next_pol == 0 then	
 			local pol = var.Get("PollSettings")
---			local cs = var.GetNumber("ChargeStatus")
---			local cls= var.GetNumber("ClimateStatus")
---			local ws = var.GetNumber("WindowMeltStatus")
 			local pol_t = {}
 			string.gsub(pol..",","(.-),", function(c) pol_t[#pol_t+1] = c end)
 			if #pol_t == 4 then 
-				-- If an action is active, use first poll time
---				if cs == 1 or cls == 1 or sw == 1 then 
---					next_pol = pol_t[1]
---				else
-					-- If not active, see if car is in atHome range or not
-					if var.GetNumber('LocationHome') == 1 then
-						next_pol = pol_t[2]
-					else	
-						next_pol = pol_t[3]
-						-- See if we are at a fast poll location
-						local fpl = var.Get('FastPollLocations')
-						local lat = var.GetNumber('Latitude')
-						local lng = var.GetNumber('Longitude')
-						if fpl ~= '' and lat ~= 0 and lng ~= 0 then
-							local locs_t = {}
-							string.gsub(fpl..";","(.-);", function(c) locs_t[#locs_t+1] = c end)
-							for i = 1, #locs_t do
-								local lc_lat, lc_lng = string.match(locs_t[i],"(.-),(.+)")
-								if _distance(lc_lat, lc_lng, lat, lng) < radius then
-									next_pol = pol_t[4]
-									break
-								end
+				-- See if car is in atHome range or not
+				if var.GetNumber('LocationHome') == 1 then
+					next_pol = pol_t[2]
+				else	
+					next_pol = pol_t[3]
+					-- See if we are at a fast poll location
+					local fpl = var.Get('FastPollLocations')
+					local lat = var.GetNumber('Latitude')
+					local lng = var.GetNumber('Longitude')
+					if fpl ~= '' and lat ~= 0 and lng ~= 0 then
+						local locs_t = {}
+						string.gsub(fpl..";","(.-);", function(c) locs_t[#locs_t+1] = c end)
+						for i = 1, #locs_t do
+							local lc_lat, lc_lng = string.match(locs_t[i],"(.-),(.+)")
+							if _distance(lc_lat, lc_lng, lat, lng) < radius then
+								next_pol = pol_t[4]
+								break
 							end
 						end
 					end
---				end
+				end
 				next_pol = next_pol * 60  -- Minutes to seconds
 			end
 		end
@@ -985,7 +1015,7 @@ function CarNetModule()
 		UpdateCarLocation = _update_car_location,
 		UpdateCarEManager = _update_car_emanager,
 		CalculateNextPoll = _calculate_next_poll,
-		CalculateDistance = _distance,
+		SetStatusMessage = _set_status_message,
 		Initialize = _init
 	}
 end
@@ -1004,14 +1034,8 @@ function CarNet_VariableChanged(lul_device, lul_service, lul_variable, lul_value
 		log.Debug("resetting CarNet done.")
 	elseif (strVariable == 'LogLevel') then	
 		-- Set log level and debug flag if needed
-		local lev = tonumber(strNewVal, 10) or '10'
-		if lev > 10 then
-			pD.Debug = true
-			pD.LogLevel = 10
-		else
-			pD.Debug = false
-			pD.LogLevel = lev
-		end
+		local lev = tonumber(strNewVal, 10) or 3
+		log.Update(lev)
 	end
 end
 
@@ -1022,7 +1046,7 @@ function CarNet_UpdateStatus(request, noSched)
 	-- After 24 hrs we do a getFullyLoadedCars command again
 	local lfp = os.time() - var.GetNumber('LastFLCPoll')
 	if request == 'loop' and lfp >  86400 and (not noSched) then
-		var.Set('DisplayLine2', 'Refreshing status...', pD.SIDS.ALTUI)
+		myModule.SetStatusMessage('Refreshing status...')
 		-- Get high level car end CatNet subscription details, run this once a day
 		cde, res = myModule.Command('getFullyLoadedCars')
 		if cde == 200 then
@@ -1036,7 +1060,7 @@ function CarNet_UpdateStatus(request, noSched)
 				end
 			end
 		else
-			var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
+			myModule.SetStatusMessage()
 			log.Log('getFullyLoadedCars failed result : '..res)
 			result = false
 		end
@@ -1054,7 +1078,7 @@ function CarNet_UpdateStatus(request, noSched)
 			log.Debug("CarNet_UpdateStatus, we have a double request within five minutes. Not starting a new.")
 			return false
 		end
-		var.Set('DisplayLine2', 'Refreshing status...', pD.SIDS.ALTUI)
+		myModule.SetStatusMessage('Refreshing status...')
 		
 		-- Send update request to car, then wait 30 seconds to see if we have a result
 		pD.lastVsrReqStarted = os.time()
@@ -1066,12 +1090,12 @@ function CarNet_UpdateStatus(request, noSched)
 				var.Set('StatusText','Update Car Status in progress....')
 				luup.call_delay("CarNet_UpdateStatus", 30, 'poll0') 
 			else
-				var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
+				myModule.SetStatusMessage()
 				var.Set('StatusText','Update Car Status request failed.')
 				result = false
 			end
 		else
-			var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
+			myModule.SetStatusMessage()
 			var.Set('StatusText','Update Car Status request failed.')
 			result = false
 		end
@@ -1116,14 +1140,14 @@ function CarNet_UpdateStatus(request, noSched)
 								log.Debug('getEManager failed result : '..res)
 							end
 						end
-						var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
+						myModule.SetStatusMessage()
 						var.Set('StatusText','Update Car Status complete.')
 						local pc = var.GetNumber("PollOk", pD.SIDS.ZW) + 1
 						var.Set("PollOk", pc, pD.SIDS.ZW)
 						pD.lastVsrReqStarted = 0
 					else
 						-- Late/rogue getVsr response without status
-						var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
+						myModule.SetStatusMessage()
 						var.Set('StatusText','Update Car Status finished.')
 						pD.lastVsrReqStarted = 0
 					end	
@@ -1144,7 +1168,7 @@ function CarNet_UpdateStatus(request, noSched)
 	if not result then
 		local pc = var.GetNumber("PollNoReply", pD.SIDS.ZW) + 1
 		var.Set("PollNoReply", pc, pD.SIDS.ZW)
-		var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
+		myModule.SetStatusMessage()
 	end
 	log.Debug("CarNet_UpdateStatus, leave")
 end
@@ -1164,35 +1188,22 @@ function CarNet_StartAction(request)
 						var.Set(as.var..'Status', as.succeed)
 						var.Set(as.var..'Message', 'Succeeded.')
 						var.Set('StatusText','Start Action, '..as.msg..' succeeded.')
-						var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
+						myModule.SetStatusMessage()
 						-- Request eManager status if required
---						if as.emanager then
-							CarNet_PollEManager()
---[[							local cde, res = myModule.Command('getEManager')
-							if cde == 200 then
-								log.Debug('getEManager result : '..res)
-								local rjs = json.decode(res)
-								if rjs.errorCode == "0" then
-									myModule.UpdateCarEManager(rjs)
-								end
-							else
-								var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
-								log.Debug('getEManager failed result : '..res)
-							end
-]]							
---						end
+						CarNet_PollEManager()
 					else
 						log.Debug('Request '..ts..' not defined in actionStateMap.')
 					end
 				else
 					log.Debug('actionType '..nt.actionType..' not defined in actionTypeMap.')
 				end
+				var.Set('PendingAction', '')
 			elseif nt.actionState == 'FAILED' or nt.actionState == 'FAILED_DELAYED' then
 				local ts = actionTypeMap[nt.actionType]
 				if ts then
 					local as = actionStateMap[ts]
 					if as then
-						var.Set('DisplayLine2', 'Last action failed', pD.SIDS.ALTUI)
+						myModule.SetStatusMessage('Last action failed')
 						var.Set(as.var..'Status', as.failed)
 						var.Set(as.var..'Message', 'Failed: '..nt.errorTitle)
 						var.Set('StatusText','Start Action, '..as.msg..' failed.')
@@ -1202,6 +1213,7 @@ function CarNet_StartAction(request)
 				else
 					log.Debug('actionType '..nt.actionType..' not defined in actionTypeMap.')
 				end
+				var.Set('PendingAction', '')
 			else	
 				-- Action(s) have not yet completed, schedule next poll. Do more frequent if we have more actions pending.
 				local pt = (((nnt == 1) and 30) or 10)
@@ -1218,7 +1230,8 @@ function CarNet_StartAction(request)
 	-- See if request is one of the commands
 	local as = actionStateMap[request]
 	if as then
-		var.Set('DisplayLine2', 'Starting Action...', pD.SIDS.ALTUI)
+		myModule.SetStatusMessage('Starting Action...')
+		var.Set('PendingAction', request)
 		var.Set('StatusText','Start Action, sending command : '..request)
 		var.Set(as.var..'Message', "Pending...")
 		var.Set(as.var..'Status', as.succeed)
@@ -1235,14 +1248,16 @@ function CarNet_StartAction(request)
 					end	
 				end	
 			else
-				var.Set('DisplayLine2', 'Failed', pD.SIDS.ALTUI)
+				myModule.SetStatusMessage('Failed')
 				var.Set(as.var..'Status', as.failed) 
 				var.Set('StatusText','Start Action, '..as.msg..' failed.')
+				var.Set('PendingAction', '')
 			end	
 		else	
-			var.Set('DisplayLine2', 'Failed', pD.SIDS.ALTUI)
+			myModule.SetStatusMessage('Failed')
 			var.Set(as.var..'Status', as.failed)
 			var.Set('StatusText','Start Action, '..as.msg..' failed.')
+			var.Set('PendingAction', '')
 		end	
 	elseif request:sub(1,4) == 'poll' then
 		-- Try up to nine poll requests 10 or 30 seconds apart depending on number of pending notifications.
@@ -1261,21 +1276,26 @@ function CarNet_StartAction(request)
 							processNotification(rjs.actionNotificationList[i],#rjs.actionNotificationList,npoll+1)
 						end	
 					else	
-						luup.call_delay("CarNet_StartAction", 10, 'poll'..npoll+1)
+						luup.call_delay("CarNet_StartAction", 15, 'poll'..npoll+1)
 					end	
-					var.Set('StatusText','Update Action Status complete.')
 				else
-					var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
+					myModule.SetStatusMessage()
 					log.Debug('getNotifications failed result : '..res)
 				end	
 			else
-				var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
+				myModule.SetStatusMessage()
 				log.Debug('getNotifications failed result : '..res)
 			end
 		else
 			log.Log('getNotifications did not return a SUCCEEDED within expected time window.',5)
 			var.Set('StatusText','Update Action Status timed out.')
-			var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
+			myModule.SetStatusMessage()
+			local as = actionStateMap[var.Get('PendingAction')]
+			if as then
+				var.Set(as.var..'Status', as.failed)
+				var.Set('StatusText','Start Action, '..as.msg..' failed.')
+			end
+			var.Set('PendingAction', '')
 		end
 	else	
 		log.Debug("CarNet_StartAction, unknown request : "..(request or ''))
@@ -1306,12 +1326,12 @@ function CarNet_PollEManager()
 					log.Debug('Schedule CarNet_PollEManager : '..tonumber(pol_t[1]) * 60)
 					luup.call_delay("CarNet_PollEManager", tonumber(pol_t[1]) * 60)
 				else	
-					var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
+					myModule.SetStatusMessage()
 				end
 			end
 		end
 	else
-		var.Set('DisplayLine2', '', pD.SIDS.ALTUI)
+		myModule.SetStatusMessage()
 		log.Debug('getEManager failed result : '..res)
 	end
 	log.Debug("CarNet_PollEManager, leave")
@@ -1325,16 +1345,7 @@ function CarNetModule_Initialize()
 	log = logAPI()
 	var = varAPI()
 	var.Initialize(pD.SIDS.MODULE, pD.DEV)
-
-	local lev = var.GetNumber("LogLevel")
-	if lev > 10 then
-		pD.Debug = true
-		pD.LogLevel = 10
-	else
-		pD.Debug = false
-		pD.LogLevel = lev
-	end
-	log.Initialize(pD.Description, pD.LogLevel, pD.Debug)
+	log.Initialize(pD.Description, var.GetNumber("LogLevel"))
 
 	log.Log("device #" .. pD.DEV .. " is initializing!",3)
 	-- See if we are running on openLuup. If not stop.
@@ -1346,14 +1357,9 @@ function CarNetModule_Initialize()
 		return true, "Incompatible with platform.", pD.Description
 	end
 		
-	--	_registerWithAltUI()
-
-	
 	-- See if user disabled plug-in 
 	if (var.GetAttribute("disabled") == 1) then
 		log.Log("Init: Plug-in version "..pD.Version.." - DISABLED",2)
---		pD.Plugin_Disabled = true
---			var.Set("LinkStatus", "Plug-in disabled")
 		-- Now we are done. Mark device as disabled
 		var.Set("DisplayLine2","Plug-in disabled", pD.SIDS.ALTUI)
 		luup.set_failure(0, pD.DEV)
