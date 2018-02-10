@@ -2,7 +2,7 @@
 	Module L_CarNet1.lua
 	
 	Written by R.Boer. 
-	V1.2, 8 February 2018
+	V1.3, 10 February 2018
 
 	This plug-in emulates a browser accessing the VolksWagen Carnet portal www.volkswagen-car-net.com.
 	A valid CarNet registration is required.
@@ -16,7 +16,7 @@ local json 		= require("dkjson")
 local https     = require("ssl.https")
 
 local pD = {
-	Version = '1.2',
+	Version = '1.3',
 	SIDS = { 
 		MODULE = 'urn:rboer-com:serviceId:CarNet1',
 		ALTUI = 'urn:upnp-org:serviceId:altui1',
@@ -159,7 +159,8 @@ local def_debug = false
 		local level = (level or 10)
 		if (def_level >= level) then
 			if (level == 10) then level = 50 end
-			luup.log(def_prefix .. ": " .. text or "no text", (level or 50)) 
+			local msg = text or "no text"
+			luup.log(def_prefix .. ": " .. msg:sub(1,60), (level or 50)) 
 		end	
 	end	
 	
@@ -813,7 +814,7 @@ function CarNetModule()
 			-- Compare to home location and set/clear at home flag when within 500 m
 			lat = tonumber(lat) or luup.latitude
 			lng = tonumber(lng) or luup.longitude
-			local radius = tonumber(var.Get('AtLocationRadius'),10) or 0.5
+			local radius = var.GetNumber('AtLocationRadius')
 			if _distance(lat,lng, luup.latitude, luup.longitude) < radius then
 				var.Set('LocationHome', 1)
 			else
@@ -974,12 +975,13 @@ function CarNetModule()
 					local fpl = var.Get('FastPollLocations')
 					local lat = var.GetNumber('Latitude')
 					local lng = var.GetNumber('Longitude')
-					if fpl ~= '' and lat ~= 0 and lng ~= 0 then
+					local radius = var.GetNumber('AtLocationRadius')
+					if fpl ~= '' and lat ~= 0 and lng ~= 0 and radius ~= 0 then
 						local locs_t = {}
 						string.gsub(fpl..";","(.-);", function(c) locs_t[#locs_t+1] = c end)
 						for i = 1, #locs_t do
 							local lc_lat, lc_lng = string.match(locs_t[i],"(.-),(.+)")
-							if _distance(lc_lat, lc_lng, lat, lng) < radius then
+							if _distance(tonumber(lc_lat), tonumber(lc_lng), lat, lng) < radius then
 								next_pol = pol_t[4]
 								break
 							end
@@ -1041,12 +1043,12 @@ end
 
 -- Global routine for polling car status. First send RequestVsr and then wait for updated status response.
 function CarNet_UpdateStatus(request, noSched)
-	local result = true
+	local deb_res = ''
 	log.Debug("CarNet_UpdateStatus, enter for " .. request)
 	-- After 24 hrs we do a getFullyLoadedCars command again
 	local lfp = os.time() - var.GetNumber('LastFLCPoll')
 	if request == 'loop' and lfp >  86400 and (not noSched) then
-		myModule.SetStatusMessage('Refreshing status...')
+		myModule.SetStatusMessage('Refreshing FLC...')
 		-- Get high level car end CatNet subscription details, run this once a day
 		cde, res = myModule.Command('getFullyLoadedCars')
 		if cde == 200 then
@@ -1056,13 +1058,11 @@ function CarNet_UpdateStatus(request, noSched)
 				if myModule.UpdateCarDetails(rjs) then 
 					var.Set('LastFLCPoll', os.time())
 				else
-					log.Log('getFullyLoadedCars failed reading data : '..res,3)
+					deb_res = 'getFullyLoadedCars failed reading data : '..res
 				end
 			end
 		else
-			myModule.SetStatusMessage()
-			log.Log('getFullyLoadedCars failed result : '..res)
-			result = false
+			deb_res = 'getFullyLoadedCars failed result : '.. res
 		end
 		-- Next update car details in a bit
 		luup.call_delay("CarNet_UpdateStatus", 10, 'loop')
@@ -1074,9 +1074,8 @@ function CarNet_UpdateStatus(request, noSched)
 		end
 		
 		-- See if we have a pending request that started less than five minutes ago. Do not start a second one.
-		if (os.time() - pD.lastVsrReqStarted) < 300 then
-			log.Debug("CarNet_UpdateStatus, we have a double request within five minutes. Not starting a new.")
-			return false
+		if (os.time() - pD.lastVsrReqStarted) < 120 then
+			deb_res = "CarNet_UpdateStatus, we have a double request within two minutes. Not starting a new."
 		end
 		myModule.SetStatusMessage('Refreshing status...')
 		
@@ -1090,14 +1089,10 @@ function CarNet_UpdateStatus(request, noSched)
 				var.Set('StatusText','Update Car Status in progress....')
 				luup.call_delay("CarNet_UpdateStatus", 30, 'poll0') 
 			else
-				myModule.SetStatusMessage()
-				var.Set('StatusText','Update Car Status request failed.')
-				result = false
+				deb_res = 'Update Car Status request failed : '..res
 			end
 		else
-			myModule.SetStatusMessage()
-			var.Set('StatusText','Update Car Status request failed.')
-			result = false
+			deb_res = 'Update Car Status request failed : '..res
 		end
 	elseif request:sub(1,4) == 'poll' then
 		-- Try up to five poll requests 30 seconds apart
@@ -1147,27 +1142,25 @@ function CarNet_UpdateStatus(request, noSched)
 						pD.lastVsrReqStarted = 0
 					else
 						-- Late/rogue getVsr response without status
-						myModule.SetStatusMessage()
-						var.Set('StatusText','Update Car Status finished.')
+						deb_res = 'Update Car Status finished.'
 						pD.lastVsrReqStarted = 0
 					end	
 				else
-					log.Debug('getVsr failed result : '..res)
-					result = false
+					deb_res = 'getVsr failed result : '..res
 				end	
 			else
-				log.Debug('getVsr failed result : '..res)
-				result = false
+				deb_res = 'getVsr failed result : '..res
 			end
 		else
-			log.Debug('getVsr did not return a REQUEST_SUCCESSFULL withing 120 seconds.')
-			var.Set('StatusText','Update Car Status timed out.')
-			result = false
+			deb_res = 'getVsr did not return a REQUEST_SUCCESSFULL withing 120 seconds.'
 		end
 	end
-	if not result then
+	if deb_res ~= '' then
 		local pc = var.GetNumber("PollNoReply", pD.SIDS.ZW) + 1
 		var.Set("PollNoReply", pc, pD.SIDS.ZW)
+		var.Set('StatusText',deb_res:sub(1,50))
+		log.Debug(deb_res)
+		log.Log(deb_res,5)
 		myModule.SetStatusMessage()
 	end
 	log.Debug("CarNet_UpdateStatus, leave")
@@ -1230,39 +1223,47 @@ function CarNet_StartAction(request)
 	-- See if request is one of the commands
 	local as = actionStateMap[request]
 	if as then
-		myModule.SetStatusMessage('Starting Action...')
-		var.Set('PendingAction', request)
-		var.Set('StatusText','Start Action, sending command : '..request)
-		var.Set(as.var..'Message', "Pending...")
-		var.Set(as.var..'Status', as.succeed)
-		local cde, res = myModule.Command(request)
-		if cde == 200 then
-			log.Debug(request..' result : '..res)
-			local rjs = json.decode(res) 
-			if rjs.errorCode == '0' then 
-				if rjs.actionNotification then 
-					processNotification(rjs.actionNotification,1,0)
-				elseif rjs.actionNotificationList then 
-					for i = 1, #rjs.actionNotificationList do
-						processNotification(rjs.actionNotificationList[i],#rjs.actionNotificationList,0)
+		-- We limit to starting/stopping one action at the time to keep things simpler
+		local pen_req = var.Get('PendingAction')
+		if pen_req == '' then
+			myModule.SetStatusMessage('Starting Action...')
+			var.Set('PendingAction', request)
+			var.Set('StatusText','Start Action, sending command : '..request)
+			var.Set(as.var..'Message', "Pending...")
+			var.Set(as.var..'Status', as.succeed)
+			local cde, res = myModule.Command(request)
+			local deb_stat = ''
+			if cde == 200 then
+				log.Debug(request..' result : '..res)
+				local rjs = json.decode(res) 
+				if rjs.errorCode == '0' then 
+					if rjs.actionNotification then 
+						processNotification(rjs.actionNotification,1,0)
+					elseif rjs.actionNotificationList then 
+						for i = 1, #rjs.actionNotificationList do
+							processNotification(rjs.actionNotificationList[i],#rjs.actionNotificationList,0)
+						end	
 					end	
+				else
+					deb_stat = 'Failed'
 				end	
 			else
+				deb_stat = 'Failed'
+			end	
+			if deb_stat ~= '' then	
 				myModule.SetStatusMessage('Failed')
-				var.Set(as.var..'Status', as.failed) 
+				var.Set(as.var..'Status', as.failed)
 				var.Set('StatusText','Start Action, '..as.msg..' failed.')
 				var.Set('PendingAction', '')
 			end	
-		else	
-			myModule.SetStatusMessage('Failed')
-			var.Set(as.var..'Status', as.failed)
-			var.Set('StatusText','Start Action, '..as.msg..' failed.')
-			var.Set('PendingAction', '')
-		end	
+		else
+			log.Debug("CarNet_StartAction, pending request, ignoring  : "..request)
+		end
 	elseif request:sub(1,4) == 'poll' then
 		-- Try up to nine poll requests 10 or 30 seconds apart depending on number of pending notifications.
 		local npoll = tonumber(request:sub(-1) or 9)
 		if npoll < 9 then
+			local deb_stat = ''
 			var.Set('StatusText','Update Car Status in progress....'..npoll)
 			local cde, res = myModule.Command('getNotifications')
 			if cde == 200 then
@@ -1276,27 +1277,32 @@ function CarNet_StartAction(request)
 							processNotification(rjs.actionNotificationList[i],#rjs.actionNotificationList,npoll+1)
 						end	
 					else	
+						-- Got empty response with only errorCode : 0, check for next
 						luup.call_delay("CarNet_StartAction", 15, 'poll'..npoll+1)
 					end	
 				else
-					myModule.SetStatusMessage()
-					log.Debug('getNotifications failed result : '..res)
+					deb_stat = 'getNotifications failed result : '..res
 				end	
 			else
-				myModule.SetStatusMessage()
-				log.Debug('getNotifications failed result : '..res)
+				deb_stat = 'getNotifications failed result : '..res
 			end
 		else
-			log.Log('getNotifications did not return a SUCCEEDED within expected time window.',5)
-			var.Set('StatusText','Update Action Status timed out.')
+			deb_stat = 'getNotifications did not return a SUCCEEDED within expected time window.'
+		end
+		-- See if things failed
+		if deb_stat ~= '' then
+			log.Debug(deb_stat)
+			log.Log(deb_stat,5)
 			myModule.SetStatusMessage()
 			local as = actionStateMap[var.Get('PendingAction')]
 			if as then
 				var.Set(as.var..'Status', as.failed)
 				var.Set('StatusText','Start Action, '..as.msg..' failed.')
+			else
+				var.Set('StatusText','Update Action Status failed.')
 			end
 			var.Set('PendingAction', '')
-		end
+		end	
 	else	
 		log.Debug("CarNet_StartAction, unknown request : "..(request or ''))
 	end
@@ -1371,6 +1377,7 @@ function CarNetModule_Initialize()
 
 	myModule.Initialize()
 	myCarNet.Initialize()
+	myModule.SetStatusMessage()
 
 	-- Set watches on email and password as userURL needs to be erased when changed
 	luup.variable_watch('CarNet_VariableChanged', pD.SIDS.MODULE, "Email", pD.DEV)
