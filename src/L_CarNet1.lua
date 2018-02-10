@@ -27,7 +27,10 @@ local pD = {
 	DEV = nil,
 	Description = 'VW CarNet',
 	onOpenLuup = false,
-	lastVsrReqStarted = 0
+	lastVsrReqStarted = 0,
+	RetryDelay = 10,
+	PollDelay = 20,
+	retryCount = 0
 }
 
 local actionStateMap = {
@@ -610,6 +613,7 @@ function CarNetModule()
 		var.Default("LightsStatus","Off")
 		var.Default("HoodStatus","Closed")
 		var.Default("Mileage")
+		var.Default("ActionRetries", "0")
 		var.Default("LocationHome", "0")
 		var.Default("FastPollLocations")
 		var.Default("AtLocationRadius", 0.5)
@@ -1065,7 +1069,7 @@ function CarNet_UpdateStatus(request, noSched)
 			deb_res = 'getFullyLoadedCars failed result : '.. res
 		end
 		-- Next update car details in a bit
-		luup.call_delay("CarNet_UpdateStatus", 10, 'loop')
+		luup.call_delay("CarNet_UpdateStatus", math.floor(pD.PollDelay/3), 'loop')
 	elseif request == 'loop' then
 		-- Schedule next update request unless we should not (for ad-hoc Poll)
 		if (not noSched) then
@@ -1087,7 +1091,7 @@ function CarNet_UpdateStatus(request, noSched)
 			local rjs = json.decode(res) 
 			if rjs.errorCode == '0' then 
 				var.Set('StatusText','Update Car Status in progress....')
-				luup.call_delay("CarNet_UpdateStatus", 30, 'poll0') 
+				luup.call_delay("CarNet_UpdateStatus", pD.PollDelay, 'poll0') 
 			else
 				deb_res = 'Update Car Status request failed : '..res
 			end
@@ -1106,7 +1110,7 @@ function CarNet_UpdateStatus(request, noSched)
 				if rjs.errorCode == '0' then 
 					local status = rjs.vehicleStatusData.requestStatus
 					if status == 'REQUEST_IN_PROGRESS' then
-						luup.call_delay("CarNet_UpdateStatus", 30, 'poll'..(npoll + 1)) 
+						luup.call_delay("CarNet_UpdateStatus", pD.PollDelay, 'poll'..(npoll + 1)) 
 					elseif status == 'REQUEST_SUCCESSFUL' then
 						-- Refresh VSR status	
 						myModule.UpdateCarStatus(rjs)
@@ -1203,13 +1207,23 @@ function CarNet_StartAction(request)
 					else
 						log.Debug('Request '..ts..' not defined in actionStateMap.')
 					end
+					-- See if we should retry the action
+					local retry = var.GetNumber("ActionRetries")
+					if pD.retryCount < retry then
+						local pend_req = var.Get('PendingAction')
+						luup.call_delay("CarNet_StartAction", pD.RetryDelay, pend_req)
+						pD.retryCount =  pD.retryCount + 1
+						myModule.SetStatusMessage('Retry #'..pD.retryCount..' of failed '..pend_req)
+					else
+						retry = nil
+					end
 				else
 					log.Debug('actionType '..nt.actionType..' not defined in actionTypeMap.')
 				end
-				var.Set('PendingAction', '')
+				if not retry then var.Set('PendingAction', '') end
 			else	
 				-- Action(s) have not yet completed, schedule next poll. Do more frequent if we have more actions pending.
-				local pt = (((nnt == 1) and 30) or 10)
+				local pt = (((nnt == 1) and pD.PollDelay) or math.floor(pD.PollDelay/2))
 				luup.call_delay("CarNet_StartAction", pt, 'poll'..np)
 				log.Debug('CarNet_StartAction - starting poll...')
 			end
@@ -1251,10 +1265,19 @@ function CarNet_StartAction(request)
 				deb_stat = 'Failed'
 			end	
 			if deb_stat ~= '' then	
-				myModule.SetStatusMessage('Failed')
+				-- See if we should retry the action
+				local rety = var.GetNumber("ActionRetries")
+				if pD.retryCount < retry then
+					local pend_req = var.Get('PendingAction')
+					luup.call_delay("CarNet_StartAction", pD.RetryDelay, pend_req)
+					 pD.retryCount =  pD.retryCount + 1
+					myModule.SetStatusMessage('Retry #'..pD.retryCount..' of failed '..pend_req)
+				else	
+					myModule.SetStatusMessage('Failed')
+					var.Set('PendingAction', '')
+				end
 				var.Set(as.var..'Status', as.failed)
 				var.Set('StatusText','Start Action, '..as.msg..' failed.')
-				var.Set('PendingAction', '')
 			end	
 		else
 			log.Debug("CarNet_StartAction, pending request, ignoring  : "..request)
@@ -1278,7 +1301,7 @@ function CarNet_StartAction(request)
 						end	
 					else	
 						-- Got empty response with only errorCode : 0, check for next
-						luup.call_delay("CarNet_StartAction", 15, 'poll'..npoll+1)
+						luup.call_delay("CarNet_StartAction", math.floor(pD.PollDelay/2), 'poll'..npoll+1)
 					end	
 				else
 					deb_stat = 'getNotifications failed result : '..res
@@ -1293,15 +1316,26 @@ function CarNet_StartAction(request)
 		if deb_stat ~= '' then
 			log.Debug(deb_stat)
 			log.Log(deb_stat,5)
-			myModule.SetStatusMessage()
-			local as = actionStateMap[var.Get('PendingAction')]
-			if as then
-				var.Set(as.var..'Status', as.failed)
-				var.Set('StatusText','Start Action, '..as.msg..' failed.')
-			else
-				var.Set('StatusText','Update Action Status failed.')
-			end
-			var.Set('PendingAction', '')
+			-- See if we should retry the action
+			local rety = var.GetNumber("ActionRetries")
+			if pD.retryCount < retry then
+				local pend_req = var.Get('PendingAction')
+				luup.call_delay("CarNet_StartAction", pD.RetryDelay, pend_req)
+				pD.retryCount =  pD.retryCount + 1
+				myModule.SetStatusMessage('Retry #'..pD.retryCount..' of failed '..pend_req)
+				local as = actionStateMap[pend_req]
+				if as then var.Set(as.var..'Status', as.failed) end
+			else	
+				myModule.SetStatusMessage()
+				local as = actionStateMap[var.Get('PendingAction')]
+				if as then
+					var.Set(as.var..'Status', as.failed)
+					var.Set('StatusText','Start Action, '..as.msg..' failed.')
+				else
+					var.Set('StatusText','Update Action Status failed.')
+				end
+				var.Set('PendingAction', '')
+			end	
 		end	
 	else	
 		log.Debug("CarNet_StartAction, unknown request : "..(request or ''))
