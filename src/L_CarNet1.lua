@@ -2,7 +2,7 @@
 	Module L_CarNet1.lua
 	
 	Written by R.Boer. 
-	V1.3, 10 February 2018
+	V1.4, 12 February 2018
 
 	This plug-in emulates a browser accessing the VolksWagen Carnet portal www.volkswagen-car-net.com.
 	A valid CarNet registration is required.
@@ -28,9 +28,10 @@ local pD = {
 	Description = 'VW CarNet',
 	onOpenLuup = false,
 	lastVsrReqStarted = 0,
-	RetryDelay = 10,
+	RetryDelay = 20,
 	PollDelay = 20,
-	retryCount = 0
+	RetryCount = 0,
+	PendingAction = ''
 }
 
 local actionStateMap = {
@@ -162,14 +163,14 @@ local def_debug = false
 		local level = (level or 10)
 		if (def_level >= level) then
 			if (level == 10) then level = 50 end
-			local msg = text or "no text"
+			local msg = (text or "no text")
 			luup.log(def_prefix .. ": " .. msg:sub(1,60), (level or 50)) 
 		end	
 	end	
 	
 	local function _debug(text)
 		if def_debug then
-			luup.log(def_prefix .. "_debug: " .. text or "no text", 50) 
+			luup.log(def_prefix .. "_debug: " .. (text or "no text"), 50) 
 		end	
 	end
 	
@@ -958,9 +959,9 @@ function CarNetModule()
 				if (mNow ~= 0) and (mNow >= mStart) then  tNow.day =  tNow.day + 1 end
 			end
 			if bMatch then
-				-- In window, next start is end time
+				-- In window, next start is end time plus one minute.
 				tNow.hour = hE
-				tNow.min = mE
+				tNow.min = mE + 1
 				tNow.sec=0
 				next_pol = os.time(tNow) - os.time()
 			end
@@ -997,6 +998,7 @@ function CarNetModule()
 		end
 
 		if (next_pol == 0) then next_pol = 3600 end
+		log.Debug("Next poll time in "..next_pol .. " seconds.")
 		return next_pol
 	end
 			
@@ -1194,9 +1196,11 @@ function CarNet_StartAction(request)
 				else
 					log.Debug('actionType '..nt.actionType..' not defined in actionTypeMap.')
 				end
-				var.Set('PendingAction', '')
+				pD.PendingAction = ''
+				pD.RetryCount = 0
 			elseif nt.actionState == 'FAILED' or nt.actionState == 'FAILED_DELAYED' then
 				local ts = actionTypeMap[nt.actionType]
+				local retry = nil
 				if ts then
 					local as = actionStateMap[ts]
 					if as then
@@ -1208,19 +1212,22 @@ function CarNet_StartAction(request)
 						log.Debug('Request '..ts..' not defined in actionStateMap.')
 					end
 					-- See if we should retry the action
-					local retry = var.GetNumber("ActionRetries")
-					if pD.retryCount < retry then
-						local pend_req = var.Get('PendingAction')
-						luup.call_delay("CarNet_StartAction", pD.RetryDelay, pend_req)
-						pD.retryCount =  pD.retryCount + 1
-						myModule.SetStatusMessage('Retry #'..pD.retryCount..' of failed '..pend_req)
+					retry = var.GetNumber("ActionRetries")
+					if pD.RetryCount < retry then
+						luup.call_delay("CarNet_StartAction", pD.RetryDelay, pD.PendingAction)
+						pD.RetryCount =  pD.RetryCount + 1
+						myModule.SetStatusMessage('Retry #'..pD.RetryCount..' of failed '..pD.PendingAction)
+						log.Debug('Retry #'..pD.RetryCount..' of failed '..pD.PendingAction)
 					else
 						retry = nil
 					end
 				else
 					log.Debug('actionType '..nt.actionType..' not defined in actionTypeMap.')
 				end
-				if not retry then var.Set('PendingAction', '') end
+				if retry == nil then 
+					pD.PendingAction = '' 
+					pD.RetryCount = 0
+				end
 			else	
 				-- Action(s) have not yet completed, schedule next poll. Do more frequent if we have more actions pending.
 				local pt = (((nnt == 1) and pD.PollDelay) or math.floor(pD.PollDelay/2))
@@ -1238,10 +1245,9 @@ function CarNet_StartAction(request)
 	local as = actionStateMap[request]
 	if as then
 		-- We limit to starting/stopping one action at the time to keep things simpler
-		local pen_req = var.Get('PendingAction')
-		if pen_req == '' then
+		if pD.PendingAction == '' or (pD.RetryCount > 0 and pD.PendingAction == request)then
 			myModule.SetStatusMessage('Starting Action...')
-			var.Set('PendingAction', request)
+			pD.PendingAction = request
 			var.Set('StatusText','Start Action, sending command : '..request)
 			var.Set(as.var..'Message', "Pending...")
 			var.Set(as.var..'Status', as.succeed)
@@ -1266,27 +1272,30 @@ function CarNet_StartAction(request)
 			end	
 			if deb_stat ~= '' then	
 				-- See if we should retry the action
-				local rety = var.GetNumber("ActionRetries")
-				if pD.retryCount < retry then
-					local pend_req = var.Get('PendingAction')
-					luup.call_delay("CarNet_StartAction", pD.RetryDelay, pend_req)
-					 pD.retryCount =  pD.retryCount + 1
-					myModule.SetStatusMessage('Retry #'..pD.retryCount..' of failed '..pend_req)
+				local retry = var.GetNumber("ActionRetries")
+				if pD.RetryCount < retry then
+					luup.call_delay("CarNet_StartAction", pD.RetryDelay, pD.PendingAction)
+					pD.RetryCount =  pD.RetryCount + 1
+					myModule.SetStatusMessage('Retry #'..pD.RetryCount..' of failed '..pD.PendingAction)
+					log.Debug('Retry #'..pD.RetryCount..' of failed '..pD.PendingAction)
 				else	
 					myModule.SetStatusMessage('Failed')
-					var.Set('PendingAction', '')
+					log.Debug('Retries #'..pD.RetryCount..' of failed '..pD.PendingAction.." all failed.")
+					pD.PendingAction = ''
+					pD.RetryCount = 0
 				end
-				var.Set(as.var..'Status', as.failed)
 				var.Set('StatusText','Start Action, '..as.msg..' failed.')
+				var.Set(as.var..'Status', as.failed)
 			end	
 		else
+			var.Set(as.var..'Status', as.failed)
 			log.Debug("CarNet_StartAction, pending request, ignoring  : "..request)
 		end
 	elseif request:sub(1,4) == 'poll' then
 		-- Try up to nine poll requests 10 or 30 seconds apart depending on number of pending notifications.
 		local npoll = tonumber(request:sub(-1) or 9)
+		local deb_stat = ''
 		if npoll < 9 then
-			local deb_stat = ''
 			var.Set('StatusText','Update Car Status in progress....'..npoll)
 			local cde, res = myModule.Command('getNotifications')
 			if cde == 200 then
@@ -1317,24 +1326,26 @@ function CarNet_StartAction(request)
 			log.Debug(deb_stat)
 			log.Log(deb_stat,5)
 			-- See if we should retry the action
-			local rety = var.GetNumber("ActionRetries")
-			if pD.retryCount < retry then
-				local pend_req = var.Get('PendingAction')
-				luup.call_delay("CarNet_StartAction", pD.RetryDelay, pend_req)
-				pD.retryCount =  pD.retryCount + 1
-				myModule.SetStatusMessage('Retry #'..pD.retryCount..' of failed '..pend_req)
-				local as = actionStateMap[pend_req]
+			local retry = var.GetNumber("ActionRetries")
+			if pD.RetryCount < retry then
+				luup.call_delay("CarNet_StartAction", pD.RetryDelay, pD.PendingAction)
+				pD.RetryCount =  pD.RetryCount + 1
+				myModule.SetStatusMessage('Retry #'..pD.RetryCount..' of failed '..pD.PendingAction)
+				log.Debug('Retry #'..pD.RetryCount..' of failed '..pD.PendingAction)
+				local as = actionStateMap[pD.PendingAction]
 				if as then var.Set(as.var..'Status', as.failed) end
 			else	
 				myModule.SetStatusMessage()
-				local as = actionStateMap[var.Get('PendingAction')]
+				local as = actionStateMap[pD.PendingAction]
 				if as then
 					var.Set(as.var..'Status', as.failed)
 					var.Set('StatusText','Start Action, '..as.msg..' failed.')
 				else
 					var.Set('StatusText','Update Action Status failed.')
 				end
-				var.Set('PendingAction', '')
+				log.Debug('Retries #'..pD.RetryCount..' of failed '..pD.PendingAction.." all failed.")
+				pD.PendingAction = ''
+				pD.RetryCount = 0
 			end	
 		end	
 	else	
