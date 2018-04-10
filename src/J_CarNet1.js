@@ -1,7 +1,7 @@
 //# sourceURL=J_CarNet1.js
 // openLuup "CarNet" Plug-in
 // Written by R.Boer. 
-// V1.2 7 February 2018
+// V1.7 9 March 2018
 //
 var CarNet = (function (api) {
 
@@ -30,6 +30,7 @@ var CarNet = (function (api) {
 				panelHtml += '<br>Plugin is disabled in Attributes.';
 			} else {	
 				var pollIntervals = [{'value':'5','label':'5 Min'},{'value':'10','label':'10 Min'},{'value':'15','label':'15 Min'},{'value':'20','label':'20 Min'},{'value':'30','label':'30 Min'},{'value':'60','label':'60 Min'},{'value':'90','label':'90 Min'},{'value':'120','label':'120 Min'}];
+				var pollSlow = [{'value':'120','label':'Two Hours'},{'value':'240','label':'Four Hours'},{'value':'1440','label':'24 Hours'}];
 				var langCodes = [{'value':'BE-NL','label':'België'},{'value':'BE-FR','label':'Belgique'},{'value':'BA','label':'Bosnia and Herzegovina'},{'value':'BG','label':'България'},{'value':'CZ','label':'Česká republika'},{'value':'DK','label':'Danmark'},{'value':'DE','label':'Deutschland'},{'value':'EE','label':'Eesti'},{'value':'GR','label':'Ελλάδα'},{'value':'ES','label':'España'},{'value':'FR','label':'France'},{'value':'HR','label':'Hrvatska'},{'value':'IS','label':'Ísland'},{'value':'IE','label':'Ireland'},{'value':'IT','label':'Italia'},{'value':'LV','label':'Latvija'},{'value':'LT','label':'Lietuva'},{'value':'LU-FR','label':'Luxembourg'},{'value':'LU-DE','label':'Luxemburg'},{'value':'HU','label':'Magyarország'},{'value':'MT','label':'Malta'},{'value':'NL','label':'Nederland'},{'value':'NO','label':'Norge'},{'value':'AT','label':'Österreich'},{'value':'PL','label':'Polska'},{'value':'PT','label':'Portugal'},{'value':'RO','label':'România'},{'value':'CH','label':'Schweiz / Svizzera / Suisse'},{'value':'SI','label':'Slovenija'},{'value':'SK','label':'Slovenská republika'},{'value':'FI','label':'Suomi'},{'value':'SE','label':'Sverige'},{'value':'UA','label':'Україна'},{'value':'GB','label':'United Kingdom'}];
 				var logLevel = [{'value':'1','label':'Error'},{'value':'2','label':'Warning'},{'value':'8','label':'Info'},{'value':'10','label':'Debug'},{'value':'11','label':'Test Debug'}];
 				var retries = [{'value':'0','label':'None'},{'value':'1','label':'One'},{'value':'2','label':'Two'},{'value':'3','label':'Three'},{'value':'4','label':'Four'}];
@@ -41,6 +42,7 @@ var CarNet = (function (api) {
 				htmlAddPulldown(deviceID, 'Poll Interval; Active', 'PI0', pollIntervals)+
 				htmlAddPulldown(deviceID, 'Poll Interval; Home Idle', 'PI1', pollIntervals)+
 				htmlAddPulldown(deviceID, 'Poll Interval; Away Idle', 'PI2', pollIntervals)+
+				htmlAddPulldown(deviceID, 'Poll Interval; Vacation Idle', 'PI4', pollSlow)+
 				htmlAddPulldown(deviceID, 'Poll Interval; Fast Locations', 'PI3', pollIntervals)+
 				htmlAddInput(deviceID, 'Fast Poll Locations (lat,lng;lat,lng)', 30, 'FastPollLocations')+ 
 				htmlAddInput(deviceID, 'No Poll time window (hh:mm-hh:mm)', 30, 'NoPollWindow')+ 

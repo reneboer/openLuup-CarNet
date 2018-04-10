@@ -2,7 +2,12 @@
 	Module L_CarNet1.lua
 	
 	Written by R.Boer. 
-	V1.4, 12 February 2018
+	V1.7, 10 April 2018
+	
+	V1.7 changes:
+			- Option to set polling frequency when house mode is vacation.
+	V1.6 changes:
+			- Set timeout in https calls as GetVSR hangs openLuup sometimes.
 
 	This plug-in emulates a browser accessing the VolksWagen Carnet portal www.volkswagen-car-net.com.
 	A valid CarNet registration is required.
@@ -14,9 +19,10 @@
 local ltn12 	= require("ltn12")
 local json 		= require("dkjson")
 local https     = require("ssl.https")
+local http		= require("socket.http")	 -- V1.6
 
 local pD = {
-	Version = '1.3',
+	Version = '1.7',
 	SIDS = { 
 		MODULE = 'urn:rboer-com:serviceId:CarNet1',
 		ALTUI = 'urn:upnp-org:serviceId:altui1',
@@ -150,7 +156,7 @@ local def_debug = false
 			def_level = 10
 		else
 			def_debug = false
-			def_level = lev
+			def_level = level
 		end
 	end	
 
@@ -293,10 +299,10 @@ local function CarNetAPI()
 		end
 		return table.concat(result, "&");
 	end
-
 	-- HTTPs Get request
 	local function HttpsGet(strURL,ReqHdrs)
 		local result = {}
+		http.TIMEOUT = 15  -- V1.6
 		local bdy,cde,hdrs,stts = https.request{
 			url=strURL, 
 			method='GET',
@@ -324,6 +330,7 @@ local function CarNetAPI()
 		else	
 			ReqHdrs["content-length"] = '0'
 		end  
+		http.TIMEOUT = 15  -- V1.6
 		local bdy,cde,hdrs,stts = https.request{
 			url=strURL, 
 			method='POST',
@@ -345,7 +352,7 @@ local function CarNetAPI()
 		local ti = title or 'Error Title'
 		local ap = acttp or 'UNKNOWN'
 		local ms = msg or 'Error Message'
-		return '{"errorCode":"'..cde..'", "actionNotification" : {"actionState":"FAILED","actionType":"'..at..'","errorTitle":"'..ti..'", "errorMessage":"'..ms..'" }}'
+		return '{"errorCode":"'..cde..'", "actionNotification" : {"actionState":"FAILED","actionType":"'..ap..'","errorTitle":"'..ti..'", "errorMessage":"'..ms..'" }}'
 	end
 
 	-- Login to portal
@@ -592,7 +599,7 @@ function CarNetModule()
 		var.Default("Token")
 		var.Default("SessionID")
 		var.Default("Language", "GB")
-		var.Default("PollSettings", '5,60,120,15') -- Active, Home Idle, Away Idle, FastPoll location
+		var.Default("PollSettings", '5,60,120,15,1440') -- Active, Home Idle, Away Idle, FastPoll, Vacation location
 		var.Default("LocationHome","0")
 		var.Default("CarName")
 		var.Default("PackageService")
@@ -941,7 +948,8 @@ function CarNetModule()
 	-- Times are for Active, Home Idle, Away Idle, FastPoll location
 	-- Unless in No Poll time window, then do not start to end of window again.
 	local function _calculate_next_poll()
-		local next_pol = 0
+		local next_poll = 0
+		local poll_end, poll_start = 0,0
 		local noptw = var.Get("NoPollWindow")
 		if noptw ~= '' then
 			local st, et = string.match(noptw,"(.-)\-(.+)")
@@ -951,6 +959,13 @@ function CarNetModule()
 			local mEnd = (hE * 60) + mE
 			local tNow = os.date("*t")
 			local mNow = (tNow.hour * 60) + tNow.min
+			tNow.hour = hS
+			tNow.min = mS
+			tNow.sec=0
+			poll_end = os.difftime(os.time(tNow),os.time())
+			tNow.hour = hE
+			tNow.min = mE + 1
+			poll_start = os.difftime(os.time(tNow),os.time())
 			local bMatch = false
 			if mEnd >= mStart then
 				bMatch = ((mNow >= mStart) and (mNow <= mEnd))
@@ -960,22 +975,19 @@ function CarNetModule()
 			end
 			if bMatch then
 				-- In window, next start is end time plus one minute.
-				tNow.hour = hE
-				tNow.min = mE + 1
-				tNow.sec=0
-				next_pol = os.time(tNow) - os.time()
+				next_poll = poll_start
 			end
 		end	
-		if next_pol == 0 then	
+		if next_poll == 0 then	
 			local pol = var.Get("PollSettings")
 			local pol_t = {}
 			string.gsub(pol..",","(.-),", function(c) pol_t[#pol_t+1] = c end)
 			if #pol_t == 4 then 
 				-- See if car is in atHome range or not
 				if var.GetNumber('LocationHome') == 1 then
-					next_pol = pol_t[2]
+					next_poll = pol_t[2]
 				else	
-					next_pol = pol_t[3]
+					next_poll = pol_t[3]
 					-- See if we are at a fast poll location
 					local fpl = var.Get('FastPollLocations')
 					local lat = var.GetNumber('Latitude')
@@ -987,25 +999,55 @@ function CarNetModule()
 						for i = 1, #locs_t do
 							local lc_lat, lc_lng = string.match(locs_t[i],"(.-),(.+)")
 							if _distance(tonumber(lc_lat), tonumber(lc_lng), lat, lng) < radius then
-								next_pol = pol_t[4]
+								next_poll = pol_t[4]
 								break
 							end
 						end
 					end
 				end
-				next_pol = next_pol * 60  -- Minutes to seconds
+				next_poll = next_poll * 60  -- Minutes to seconds
+			elseif #pol_t == 5 then -- V1.7 and later with house mode Vacation
+				-- See if House Mode is Vacation, use that poll time.
+				local house_mode = var.GetAttribute("Mode",0)
+				if house_mode == 4 then
+					next_poll = pol_t[5]
+				-- Nope, see if the car is at home location.	
+				elseif var.GetNumber('LocationHome') == 1 then
+					next_poll = pol_t[2]
+				-- Nope, check fasst poll location(s)	
+				else	
+					next_poll = pol_t[3]
+					-- See if we are at a fast poll location
+					local fpl = var.Get('FastPollLocations')
+					local lat = var.GetNumber('Latitude')
+					local lng = var.GetNumber('Longitude')
+					local radius = var.GetNumber('AtLocationRadius')
+					if fpl ~= '' and lat ~= 0 and lng ~= 0 and radius ~= 0 then
+						local locs_t = {}
+						string.gsub(fpl..";","(.-);", function(c) locs_t[#locs_t+1] = c end)
+						for i = 1, #locs_t do
+							local lc_lat, lc_lng = string.match(locs_t[i],"(.-),(.+)")
+							if _distance(tonumber(lc_lat), tonumber(lc_lng), lat, lng) < radius then
+								next_poll = pol_t[4]
+								break
+							end
+						end
+					end
+				end
+				next_poll = next_poll * 60  -- Minutes to seconds
 			end
 		end
-
-		if (next_pol == 0) then next_pol = 3600 end
-		log.Debug("Next poll time in "..next_pol .. " seconds.")
-		return next_pol
+		-- See if the schedule pushed us into no poll window. Then skip until end of window.
+		if (poll_start ~= 0 and poll_end ~= 0 and next_poll > poll_end) then next_poll = poll_start end
+		if (next_poll == 0) then next_poll = 3600 end
+		log.Debug("Next poll time in "..next_poll .. " seconds.")
+		return next_poll
 	end
 			
 	-- Trigger an update of the car status by sending RequestVsr now
 	local function _poll()
 		log.Debug("Poll, enter")
-		CarNet_UpdateStatus('loop', false)
+		CarNet_UpdateStatus('loop', true)
 	end
 	
 	local function _start_action(request)
@@ -1081,8 +1123,9 @@ function CarNet_UpdateStatus(request, noSched)
 		
 		-- See if we have a pending request that started less than five minutes ago. Do not start a second one.
 		if (os.time() - pD.lastVsrReqStarted) < 120 then
-			deb_res = "CarNet_UpdateStatus, we have a double request within two minutes. Not starting a new."
-		end
+			log.Debug("CarNet_UpdateStatus, we have a double request within two minutes. Not starting a new.")
+			return
+		end	
 		myModule.SetStatusMessage('Refreshing status...')
 		
 		-- Send update request to car, then wait 30 seconds to see if we have a result
