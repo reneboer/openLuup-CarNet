@@ -1,7 +1,7 @@
 //# sourceURL=J_CarNet1.js
 // openLuup "CarNet" Plug-in
 // Written by R.Boer. 
-// V1.7 9 March 2018
+// V2.2 27 February 2019
 //
 var CarNet = (function (api) {
 
@@ -56,6 +56,22 @@ var CarNet = (function (api) {
 	
 	function _showStatus() {
 		_init();
+		// Thanks for amg0
+		function _format2Digits(d) {
+			return ("0"+d).substr(-2);
+		}	
+		// Format time stamp to dd-mm-yyyy, hh:mm:ss
+		function _getFormattedDate(ts) {
+			var date = new Date(ts * 1000);
+			var month = _format2Digits(date.getMonth() + 1);
+			var day = _format2Digits(date.getDate());
+			var hour = _format2Digits(date.getHours());
+			var min = _format2Digits(date.getMinutes());
+			var sec = _format2Digits(date.getSeconds());
+			var str = day + "-" + month + "-" + date.getFullYear() + ", " +  hour + ":" + min + ":" + sec;
+			return str;
+		}
+		
         try {
 			var deviceID = api.getCpanelDeviceId();
 			var deviceObj = api.getDeviceObject(deviceID);
@@ -68,6 +84,9 @@ var CarNet = (function (api) {
 				var lat = Number.parseFloat(varGet(deviceID, 'Latitude')).toFixed(4);
 				var lng = Number.parseFloat(varGet(deviceID, 'Longitude')).toFixed(4);
 				var clh = varGet(deviceID, 'LocationHome');
+				var lcst = varGet(deviceID, 'LastCarMessageTimestamp');
+				var inst = varGet(deviceID, 'ServiceInspectionData');
+				var rqs = varGet(deviceID, 'RequestStatus');
 				var ppls = varGet(deviceID, 'PowerPlugLockState');
 				var pps = varGet(deviceID, 'PowerPlugState');
 				var psc = varGet(deviceID, 'PowerSupplyConnected');
@@ -95,7 +114,11 @@ var CarNet = (function (api) {
 				panelHtml += '<p><div class="col-12" style="overflow-x: auto;"><table class="table-responsive-OFF table-sm"><tbody>'+
 					'<tr><td colspan="2">CarNet subscription name </td><td>'+cn+'</td></tr>'+
 					'<tr><td> </td><td> </td><td></td></tr>'+
+					'<tr><td>Last Car Message received at </td><td>'+ _getFormattedDate(lcst) + '</td><td></td></tr>'+
+					'<tr><td>Request status </td><td>'+ rqs +'</td><td></td></tr>'+
+					'<tr><td> </td><td> </td><td></td></tr>'+
 					'<tr><td>Milage </td><td>'+mlg+' Km</td></tr>'+
+					'<tr><td>Service </td><td>'+inst+' Km</td></tr>'+
 					'<tr><td> </td><td> </td><td></td></tr>'+
 					'<tr><td>Car location </td><td>'+(clh==='1'?'Home':'Away')+'</td><td>Latitude : '+lat+', Longitude : '+lng+'</td></tr>'+
 					'<tr><td>Power Status </td><td colspan="2">'+psm+'</td></tr>'+
@@ -104,6 +127,7 @@ var CarNet = (function (api) {
 					'<tr><td>Doors Status </td><td colspan="2">'+drs+'</td></tr>'+
 					'<tr><td>Windows Status </td><td colspan="2">'+wins+'</td></tr>'+
 					'<tr><td>Lights Status </td><td colspan="2">'+(lts==='1'?'On':'Off')+'</td></tr>'+
+					'<tr><td> </td><td> </td><td></td></tr>'+
 					'<tr><td> </td><td> </td><td></td></tr>'+
 					'<tr><td colspan="2">Subscription expiry date </td><td>'+psed+'</td><td></td></tr>'+
 					'</tbody></table></div></p>';

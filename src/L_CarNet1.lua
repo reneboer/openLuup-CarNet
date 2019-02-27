@@ -2,8 +2,16 @@
 	Module L_CarNet1.lua
 	
 	Written by R.Boer. 
-	V1.7, 10 April 2018
+	V2.2, 27 February 2019
 	
+	V2.2 changes:
+			- Added get-vehicle-details to polling loop as some details are no longer in get-vsr.
+	V2.1.1 changes:
+			- Bug fix.
+	V2.1 changes:
+			- Some rewrites to make modules more logical.
+	V2.0 changes:
+			- New polling logic to match updated CarNet web site.
 	V1.7 changes:
 			- Option to set polling frequency when house mode is vacation.
 	V1.6 changes:
@@ -22,7 +30,7 @@ local https     = require("ssl.https")
 local http		= require("socket.http")	 -- V1.6
 
 local pD = {
-	Version = '1.7',
+	Version = '2.2',
 	SIDS = { 
 		MODULE = 'urn:rboer-com:serviceId:CarNet1',
 		ALTUI = 'urn:upnp-org:serviceId:altui1',
@@ -35,6 +43,7 @@ local pD = {
 	onOpenLuup = false,
 	lastVsrReqStarted = 0,
 	RetryDelay = 20,
+	RetryMax = 6,
 	PollDelay = 20,
 	RetryCount = 0,
 	PendingAction = ''
@@ -317,6 +326,7 @@ local function CarNetAPI()
 	local function HttpsPost(strURL,ReqHdrs,PostData)
 		local result = {}
 		local request_body = nil
+log.Debug("HttpsPost 1 "..strURL)		
 		if PostData then
 			-- We pass JSONs as string as they are simple in this application
 			if type(PostData) == 'string' then
@@ -327,9 +337,11 @@ local function CarNetAPI()
 				request_body=postencode(PostData)
 			end
 			ReqHdrs["content-length"] = string.len(request_body)
+log.Debug("HttpsPost 2 "..request_body)		
 		else	
+log.Debug("HttpsPost 2, no body ")		
 			ReqHdrs["content-length"] = '0'
-		end  
+		end 
 		http.TIMEOUT = 15  -- V1.6
 		local bdy,cde,hdrs,stts = https.request{
 			url=strURL, 
@@ -338,6 +350,7 @@ local function CarNetAPI()
 			source = ltn12.source.string(request_body),
 			headers = ReqHdrs
 		}
+log.Debug("HttpsPost 3 "..cde)		
 		return bdy,cde,hdrs,result
 	end	
 
@@ -559,7 +572,10 @@ local function CarNetAPI()
 			req_hdrs['origin'] = 'https://'..port_host
 			req_hdrs['referer'] = _url
 			req_hdrs['cookie'] = 'JSESSIONID='.. sessionid ..'; GUEST_LANGUAGE_ID='..isoLC..'; COOKIE_SUPPORT=true; CARNET_LANGUAGE_ID='..isoLC
+log.Debug('SendCommand Cookie 2 :'.. 'JSESSIONID='.. sessionid ..'; GUEST_LANGUAGE_ID='..isoLC..'; COOKIE_SUPPORT=true; CARNET_LANGUAGE_ID='..isoLC)
+			
 			local bdy,cde,hdrs,result = HttpsPost(base_url..cm_url,req_hdrs,cm_data)
+log.Debug('SendCommand res :'..cde)
 			-- We have a redirect because session expired, so tell caller to login again
 			if cde == 302 then
 				return cde
@@ -602,6 +618,9 @@ function CarNetModule()
 		var.Default("PollSettings", '5,60,120,15,1440') -- Active, Home Idle, Away Idle, FastPoll, Vacation location
 		var.Default("LocationHome","0")
 		var.Default("CarName")
+		var.Default("RequestStatus")
+		var.Default("LastCarMessageTimestamp")
+		var.Default("ServiceInspectionData")
 		var.Default("PackageService")
 		var.Default("PackageServiceActDate")
 		var.Default("PackageServiceExpDate")
@@ -704,6 +723,8 @@ function CarNetModule()
 				log.Debug(res)	
 				return cde, res
 			end	
+		else
+			return cde, res
 		end
 	end
 	
@@ -716,8 +737,10 @@ function CarNetModule()
 	end
 
 	-- We have an updated VSR car status
-	local function _update_car_status(rjs)
+	local function _update_car_status()
 		local n_doors = 2
+		local status = false
+		local deb_res = ""
 		
 		local function buildStatusText(item, drs, lckd)
 			local txt_t = {}
@@ -739,210 +762,310 @@ function CarNetModule()
 			end
 		end
 		
-		if rjs.vehicleStatusData then
-			local vsd = rjs.vehicleStatusData
-			-- VSR has desired details, request an update and then poll until we have successful request response
-			if vsd.carRenderData then
-				local crd = vsd.carRenderData
-				-- parking lights status 2 should be off, else on
-				if crd.parkingLights then
-					if crd.parkingLights ~= 2 then
-						var.Set('LightsStatus','On')
-					else
-						var.Set('LightsStatus','Off')
+		local cde, res = _command('getVsr')
+		if cde == 200 then
+			log.Debug('getVsr result : '..res)
+			local rjs = json.decode(res) 
+			if rjs.errorCode == '0' then 
+				if rjs.vehicleStatusData then
+					local vsd = rjs.vehicleStatusData
+					var.Set("RequestStatus",(vsd.requestStatus or "no report"))
+					-- VSR has desired details, request an update and then poll until we have successful request response
+					if vsd.carRenderData then
+						local crd = vsd.carRenderData
+						-- parking lights status 2 should be off, else on
+						if crd.parkingLights then
+							if crd.parkingLights ~= 2 then
+								var.Set('LightsStatus','On')
+							else
+								var.Set('LightsStatus','Off')
+							end
+						end	
+						-- Hood status 3 should be closed, else open
+						if crd.hood then
+							if crd.hood ~= 3 then
+								var.Set('HoodStatus','Open')
+							else
+								var.Set('HoodStatus','Closed')
+							end
+						end	
+						-- See number of doors
+						if crd.doors and crd.doors.number_of_doors == 4 then n_doors = 4 end
+						-- Door/trunk status 3 should be closed, else open
+						if crd.doors then
+							local txt = buildStatusText(crd.doors, n_doors, 3)
+							if txt then
+								var.Set('DoorsStatus', txt .. 'open')
+								var.Set('IconSet',3)
+							else	
+								var.Set('DoorsStatus', 'Closed')
+							end	
+						end	
+						-- Window status 3 should be closed, 2 (partially) open
+						if crd.windows then
+							local txt = buildStatusText(crd.windows, n_doors, 3)
+							if txt then
+								var.Set('WindowsStatus', txt .. 'open')
+							else	
+								var.Set('WindowsStatus', 'Closed')
+							end	
+						end	
+						-- Sunroof status 3 should be closed, else open
+						if crd.sunroof then
+							if crd.sunroof ~= 3 then
+								var.Set('SunroofStatus','Open')
+							else
+								var.Set('SunroofStatus','Closed')
+							end
+						end	
 					end
-				end	
-				-- Hood status 3 should be closed, else open
-				if crd.hood then
-					if crd.hood ~= 3 then
-						var.Set('HoodStatus','Open')
-					else
-						var.Set('HoodStatus','Closed')
-					end
-				end	
-				-- See number of doors
-				if crd.doors and crd.doors.number_of_doors == 4 then n_doors = 4 end
-				-- Door/trunk status 3 should be closed, else open
-				if crd.doors then
-					local txt = buildStatusText(crd.doors, n_doors, 3)
-					if txt then
-						var.Set('DoorsStatus', txt .. 'open')
-						var.Set('IconSet',3)
-					else	
-						var.Set('DoorsStatus', 'Closed')
+					-- Locks status 3 should be locked, 2 unlocked
+					if vsd.lockData then
+						local txt =	buildStatusText(vsd.lockData, n_doors, 2)
+						if txt then
+							var.Set('LocksStatus', txt..'unlocked')
+							var.Set('IconSet',3)
+						else	
+							var.Set('LocksStatus','Locked')
+						end
 					end	
-				end	
-				-- Window status 3 should be closed, 2 (partially) open
-				if crd.windows then
-					local txt = buildStatusText(crd.windows, n_doors, 3)
-					if txt then
-						var.Set('WindowsStatus', txt .. 'open')
-					else	
-						var.Set('WindowsStatus', 'Closed')
-					end	
-				end	
-				-- Sunroof status 3 should be closed, else open
-				if crd.sunroof then
-					if crd.sunroof ~= 3 then
-						var.Set('SunroofStatus','Open')
-					else
-						var.Set('SunroofStatus','Closed')
+					-- Get mileage and refresh time details
+					if vsd.headerData then
+						if vsd.headerData.mileage then var.Set('Mileage',vsd.headerData.mileage) end
+						if vsd.headerData.lastRefreshTime then 
+							var.Set('LastVsrRefreshTime',vsd.headerData.lastRefreshTime[1]..', '..vsd.headerData.lastRefreshTime[2]) 
+						end
 					end
-				end	
-			end
-			-- Locks status 3 should be locked, 2 unlocked
-			if vsd.lockData then
-				local txt =	buildStatusText(vsd.lockData, n_doors, 2)
-				if txt then
-					var.Set('LocksStatus', txt..'unlocked')
-					var.Set('IconSet',3)
-				else	
-					var.Set('LocksStatus','Locked')
+					if  vsd.requestStatus then var.Set("RequestStatus",vsd.requestStatus) end
+					-- Get Battery details if available, get from e-manager
+					--if vsd.batteryLevel then var.Set("BatteryLevel", vsd.batteryLevel , pD.SIDS.HA) end
+					--if vsd.batteryRange then var.Set("BatteryRange", vsd.batteryRange) end
+					status = true
+				else
+					deb_res = 'getVsr failed missing Vehicle Status Data : '.. res
 				end
-			end	
-			-- Get mileage and refresh time details
-			if vsd.headerData then
-				if vsd.headerData.mileage then var.Set('Mileage',vsd.headerData.mileage) end
-				if vsd.headerData.lastRefreshTime then 
-					var.Set('LastVsrRefreshTime',vsd.headerData.lastRefreshTime[1]..', '..vsd.headerData.lastRefreshTime[2]) 
-				end
+			else
+				deb_res = 'getVsr returned an error : '..res
 			end
-			-- Get Battery details if available, get from e-manager
-			--if vsd.batteryLevel then var.Set("BatteryLevel", vsd.batteryLevel , pD.SIDS.HA) end
-			--if vsd.batteryRange then var.Set("BatteryRange", vsd.batteryRange) end
-			return true
+			rjs = nil
 		else
-			return false
+			deb_res = 'getVsr HTTP error : '.. cde
 		end
+		return status, deb_res
 	end
 
 	-- We have an updated car location
-	local function _update_car_location(rjs)
-		if rjs.position then
-			local lat = (rjs.position.lat or 0)
-			local lng = (rjs.position.lng or 0)
-			var.Set('Latitude', lat)
-			var.Set('Longitude', lng)
-			-- Compare to home location and set/clear at home flag when within 500 m
-			lat = tonumber(lat) or luup.latitude
-			lng = tonumber(lng) or luup.longitude
-			local radius = var.GetNumber('AtLocationRadius')
-			if _distance(lat,lng, luup.latitude, luup.longitude) < radius then
-				var.Set('LocationHome', 1)
+	local function _update_car_location()
+		local status = false
+		local deb_res = ""
+		local cde, res = _command('getLocation')
+		if cde == 200 then
+			log.Debug('getLocation result : '..res)
+			local rjs = json.decode(res)
+			if rjs.errorCode == "0" then
+				if rjs.position then
+					local lat = (rjs.position.lat or 0)
+					local lng = (rjs.position.lng or 0)
+					var.Set('Latitude', lat)
+					var.Set('Longitude', lng)
+					-- Compare to home location and set/clear at home flag when within 500 m
+					lat = tonumber(lat) or luup.latitude
+					lng = tonumber(lng) or luup.longitude
+					local radius = var.GetNumber('AtLocationRadius')
+					if _distance(lat,lng, luup.latitude, luup.longitude) < radius then
+						var.Set('LocationHome', 1)
+					else
+						var.Set('LocationHome', 0)
+					end
+					status = true
+				else
+					deb_res = 'getLocation failed missing position data : '..res
+				end
 			else
-				var.Set('LocationHome', 0)
+				deb_res = 'getLocation returned an error : '..res
 			end
-			return true
+			rjs = nil
 		else
-			return false
+			deb_res = 'getLocation HTTP error : '.. cde
 		end
+		return status, deb_res
 	end
 	
-	-- We have updated e-manager data, return any remaining charge or climate time.
-	local function _update_car_emanager(rjs)
-		local rem_time = 0
-		if rjs.EManager then
-			local rbcs = rjs.EManager.rbc.status
-			local icon = 0
-			-- Get Battery details if available
-			local bp, er, ct = '','', ''
-			if rbcs.batteryPercentage then 
-				bp = rbcs.batteryPercentage 
-				var.Set("BatteryLevel", bp , pD.SIDS.HA)
-			end
-			if rbcs.electricRange then 
-				er = rbcs.electricRange 
-				var.Set("ElectricRange", er)
-			end
-			-- Get charge status
-			if rbcs.chargingState then var.Set("ChargeStatus", ((rbcs.chargingState == 'CHARGING' and '1') or '0')) end
-			if rbcs.chargingRemaningHour and rbcs.chargingRemaningMinute then 
-				rem_time = tonumber(rbcs.chargingRemaningHour) + tonumber(rbcs.chargingRemaningMinute)
-				ct = rbcs.chargingRemaningHour ..':'.. rbcs.chargingRemaningMinute
-				var.Set("RemainingChargeTime", ct) 
-			end
-			if var.GetNumber('EManager') == 1 then
-				if rbcs.chargingState == 'CHARGING' then
-					var.Set('ChargeMessage', 'Battery '..bp..'%, range '..er..'km, time remaning '..ct)
-					var.Set('DisplayLine2', 'Charging; range '..er..'km, time remaning '..ct, pD.SIDS.ALTUI)
-					icon = 1
-				else	
-					var.Set('ChargeMessage', 'Battery '..bp..'%, range '..er..'km')
+	-- We have updated vehicle details
+	local function _update_vehicle_details()
+		local status = false
+		local deb_res = ""
+		local cde, res = _command('getVehicleDetails')
+		if cde == 200 then
+			log.Debug('getVehicleDetails result : '..res)
+			local rjs = json.decode(res)
+			if rjs.errorCode == "0" then
+				if rjs.vehicleDetails then
+					local ts = rjs.vehicleDetails.lastConnectionTimeStamp 
+					if ts then
+						local tsd = ts[1]
+						local tst = ts[2]
+						if tsd and tst then
+							local tso = os.time { year=tonumber(tsd:sub(7,-1)), month=tonumber(tsd:sub(4,5)), day=tonumber(tsd:sub(1,2)), hour=tonumber(tst:sub(1,2)), min=tonumber(tst:sub(4,-1)) }
+							var.Set('LastCarMessageTimestamp', (tso or 0))
+						end
+					end	
+					var.Set('ServiceInspectionData', (rjs.vehicleDetails.serviceInspectionData or ""))
+					var.Set('Mileage', (rjs.vehicleDetails.distanceCovered or "")) -- V2.2
+					status = true
+				else		
+				deb_res = 'getVehicleDetails failed missing vehicle details : '..res
 				end
-			else	
-				var.Set('ChargeMessage', 'Not supported')
+			else
+				deb_res = 'getVehicleDetails returned an error : '..res
 			end
-			if rbcs.pluginState then var.Set("PowerPlugState", ((rbcs.pluginState == 'CONNECTED' and '1') or '0')) end
-			if rbcs.lockState then var.Set("PowerPlugLockState", ((rbcs.lockState == 'LOCKED' and '1') or '0')) end
-			if rbcs.extPowerSupplyState then var.Set("PowerSupplyConnected", ((rbcs.extPowerSupplyState == 'AVAILABLE' and '1') or '0')) end
-			-- Get climatisation status
-			local rpcs, tt, tr = rjs.EManager.rpc.settings, '', ''
-			if rpcs.targetTemperature then 
-				tt = rpcs.targetTemperature
-				var.Set("ClimateTargetTemp", tt)
-			end
-			rpcs = rjs.EManager.rpc.status
-			local wh = '0'
-			if rpcs.climatisationWithoutHVPower then var.Set("ClimatesationWithoutHVPower", ((rpcs.climatisationWithoutHVPower and '1') or '0')) end
-			if rpcs.climatisationState then 
-				wh = ((rpcs.climatisationState == 'OFF' and '0') or '1')
-				var.Set("ClimateStatus", wh) 
-			end
-			if rpcs.climatisationRemaningTime then 
-				tr = rpcs.climatisationRemaningTime
-				if rem_time == 0 then rem_time = tonumber(tr) end
-				var.Set("ClimateRemainingTime", tr) 
-			end
-			if wh == '1' then
-				var.Set('ClimateMessage', 'Target '..tt..'C, time remaning '..tr)
-				if icon == 0 then icon = 2 end
-			else	
-				var.Set('ClimateMessage', '')
-			end
-			wh = '0'
-			if rpcs.windowHeatingAvailable then 
-				if rpcs.windowHeatingStateFront then 
-					wh = (((rpcs.windowHeatingStateFront == 'ON' or rpcs.windowHeatingStateRear == 'ON') and '1') or '0')
-					var.Set("WindowMeltStatus", wh)
-				end	
-			end	
-			if wh == '0' then var.Set('WindowMeltMessage', '') end
-			var.Set('IconSet',icon)
+			rjs = nil
+		else
+			deb_res = 'getVehicleDetails HTTP error : '.. cde
 		end
-		return rem_time
+		return status, deb_res
+	end
+
+	-- We have updated e-manager data, return any remaining charge or climate time.
+	local function _update_car_emanager()
+		local status = false
+		local deb_res = ""
+		local rem_time = 0
+		local cde, res = _command('getEManager')
+		if cde == 200 then
+			log.Debug('getEManager result : '..res)
+			local rjs = json.decode(res)
+			if rjs.errorCode == "0" then
+				if rjs.EManager then
+					local rbcs = rjs.EManager.rbc.status
+					local icon = 0
+					-- Get Battery details if available
+					local bp, er, ct = '','', ''
+					if rbcs.batteryPercentage then 
+						bp = rbcs.batteryPercentage 
+						var.Set("BatteryLevel", bp , pD.SIDS.HA)
+					end
+					if rbcs.electricRange then 
+						er = rbcs.electricRange 
+						var.Set("ElectricRange", er)
+					end
+					-- Get charge status
+					if rbcs.chargingState then var.Set("ChargeStatus", ((rbcs.chargingState == 'CHARGING' and '1') or '0')) end
+					if rbcs.chargingRemaningHour and rbcs.chargingRemaningMinute then 
+						rem_time = tonumber(rbcs.chargingRemaningHour) + tonumber(rbcs.chargingRemaningMinute)
+						ct = rbcs.chargingRemaningHour ..':'.. rbcs.chargingRemaningMinute
+						var.Set("RemainingChargeTime", ct) 
+					end
+					if var.GetNumber('EManager') == 1 then
+						if rbcs.chargingState == 'CHARGING' then
+							var.Set('ChargeMessage', 'Battery '..bp..'%, range '..er..'km, time remaning '..ct)
+							var.Set('DisplayLine2', 'Charging; range '..er..'km, time remaning '..ct, pD.SIDS.ALTUI)
+							icon = 1
+						else	
+							var.Set('ChargeMessage', 'Battery '..bp..'%, range '..er..'km')
+						end
+					else	
+						var.Set('ChargeMessage', 'Not supported')
+					end
+					if rbcs.pluginState then var.Set("PowerPlugState", ((rbcs.pluginState == 'CONNECTED' and '1') or '0')) end
+					if rbcs.lockState then var.Set("PowerPlugLockState", ((rbcs.lockState == 'LOCKED' and '1') or '0')) end
+					if rbcs.extPowerSupplyState then var.Set("PowerSupplyConnected", ((rbcs.extPowerSupplyState == 'AVAILABLE' and '1') or '0')) end
+					-- Get climatisation status
+					local rpcs, tt, tr = rjs.EManager.rpc.settings, '', ''
+					if rpcs.targetTemperature then 
+						tt = rpcs.targetTemperature
+						var.Set("ClimateTargetTemp", tt)
+					end
+					rpcs = rjs.EManager.rpc.status
+					local wh = '0'
+					if rpcs.climatisationWithoutHVPower then var.Set("ClimatesationWithoutHVPower", ((rpcs.climatisationWithoutHVPower and '1') or '0')) end
+					if rpcs.climatisationState then 
+						wh = ((rpcs.climatisationState == 'OFF' and '0') or '1')
+						var.Set("ClimateStatus", wh) 
+					end
+					if rpcs.climatisationRemaningTime then 
+						tr = rpcs.climatisationRemaningTime
+						if rem_time == 0 then rem_time = tonumber(tr) end
+						var.Set("ClimateRemainingTime", tr) 
+					end
+					if wh == '1' then
+						var.Set('ClimateMessage', 'Target '..tt..'C, time remaning '..tr)
+						if icon == 0 then icon = 2 end
+					else	
+						var.Set('ClimateMessage', '')
+					end
+					wh = '0'
+					if rpcs.windowHeatingAvailable then 
+						if rpcs.windowHeatingStateFront then 
+							wh = (((rpcs.windowHeatingStateFront == 'ON' or rpcs.windowHeatingStateRear == 'ON') and '1') or '0')
+							var.Set("WindowMeltStatus", wh)
+						end	
+					end	
+					if wh == '0' then var.Set('WindowMeltMessage', '') end
+					var.Set('IconSet',icon)
+				else	
+					deb_res = 'getEManager failed reading data, no EManager data : '..res
+				end
+				status = true
+			else
+				deb_res = 'getEManager returned an error : '..res
+			end
+			rjs = nil
+		else
+			deb_res = 'getEManager HTTP error : '.. cde
+		end
+		return status, deb_res
 	end
 
 	-- We have updated car details data
-	local function _update_car_details(rjs)
-		if rjs.fullyLoadedVehiclesResponse then
-			local data 
-			-- See what entry holds the data. Not sure why my car is in vehiclesNotFullyLoaded and I do not know if completeVehicles will have the same data
-			-- You should also get more details from this data when you have more then one car on the account. Not supporting this for now. Single car only.
-			if #rjs.fullyLoadedVehiclesResponse.completeVehicles == 1 then data = rjs.fullyLoadedVehiclesResponse.completeVehicles[1] end
-			if #rjs.fullyLoadedVehiclesResponse.vehiclesNotFullyLoaded == 1 then data = rjs.fullyLoadedVehiclesResponse.vehiclesNotFullyLoaded[1] end
-			if data then
-				var.Set('CarName', data.name)
-				var.Set('DisplayLine1',"Car : "..data.name, pD.SIDS.ALTUI)
-				-- Check if we have a (Hybrid) electric car
-				var.Set('EManager', (((data.engineTypeHybridOCU1 or data.engineTypeHybridOCU1 or data.engineTypeElectric) and '1') or '0'))
-				-- Get package details
-				if #data.packageServices == 1 then
-					local pkg = data.packageServices[1]
-					var.Set("PackageService", pkg.packageServiceName)
-					var.Set("PackageServiceActDate", pkg.activationDate)
-					var.Set("PackageServiceExpDate", pkg.expirationDate)
-					var.Set("PackageServiceExpired", ((pkg.expired and '1') or '0'))
-					expm = (pkg.expireInAMonth and '1') or '0'
-					var.Set("PackageServiceExpireInAmonth", expm)
-					if (expm == '1') then var.Set('DisplayLine2', 'Your CarNet subscription will expire '.. pkg.expirationDate, pD.SIDS.ALTUI) end
+	local function _update_car_details()
+		local status = false
+		local deb_res = ""
+		local cde, res = _command('getFullyLoadedCars')
+		if cde == 200 then
+			log.Debug('getFullyLoadedCars result : '..res)
+			local rjs = json.decode(res)
+			if rjs.errorCode == "0" then
+				if rjs.fullyLoadedVehiclesResponse then
+					local data 
+					-- See what entry holds the data. Not sure why my car is in vehiclesNotFullyLoaded and I do not know if completeVehicles will have the same data
+					-- You should also get more details from this data when you have more then one car on the account. Not supporting this for now. Single car only.
+					if #rjs.fullyLoadedVehiclesResponse.completeVehicles == 1 then 
+						data = rjs.fullyLoadedVehiclesResponse.completeVehicles[1] 
+					elseif #rjs.fullyLoadedVehiclesResponse.vehiclesNotFullyLoaded == 1 then 
+						data = rjs.fullyLoadedVehiclesResponse.vehiclesNotFullyLoaded[1] 
+					end
+					if data then
+						var.Set('CarName', data.name)
+						var.Set('DisplayLine1',"Car : "..data.name, pD.SIDS.ALTUI)
+						-- Check if we have a (Hybrid) electric car
+						var.Set('EManager', (((data.engineTypeHybridOCU1 or data.engineTypeHybridOCU1 or data.engineTypeElectric) and '1') or '0'))
+						-- Get package details
+						if #data.packageServices == 1 then
+							local pkg = data.packageServices[1]
+							var.Set("PackageService", pkg.packageServiceName)
+							var.Set("PackageServiceActDate", pkg.activationDate)
+							var.Set("PackageServiceExpDate", pkg.expirationDate)
+							var.Set("PackageServiceExpired", ((pkg.expired and '1') or '0'))
+							expm = (pkg.expireInAMonth and '1') or '0'
+							var.Set("PackageServiceExpireInAmonth", expm)
+							if (expm == '1') then var.Set('DisplayLine2', 'Your CarNet subscription will expire '.. pkg.expirationDate, pD.SIDS.ALTUI) end
+						end
+						status = true
+					else
+						deb_res = 'getFullyLoadedCars failed reading Vehicle data : '..res
+					end
+				else
+					deb_res = 'getFullyLoadedCars failed reading data, no Loaded Vehicles : '..res
 				end
-				return true
 			else
-				return false
+				deb_res = 'getFullyLoadedCars returned an error : '..res
 			end
+			rjs = nil
 		else
-			return false
+			deb_res = 'getFullyLoadedCars HTTP error : '.. cde
 		end
+		return status, deb_res
 	end
 	
 	-- Times are for Active, Home Idle, Away Idle, FastPoll location
@@ -965,7 +1088,6 @@ function CarNetModule()
 			poll_end = os.difftime(os.time(tNow),os.time())
 			tNow.hour = hE
 			tNow.min = mE + 1
-			poll_start = os.difftime(os.time(tNow),os.time())
 			local bMatch = false
 			if mEnd >= mStart then
 				bMatch = ((mNow >= mStart) and (mNow <= mEnd))
@@ -973,6 +1095,7 @@ function CarNetModule()
 				bMatch = ((mNow >= mStart) or (mNow <= mEnd))
 				if (mNow ~= 0) and (mNow >= mStart) then  tNow.day =  tNow.day + 1 end
 			end
+			poll_start = os.difftime(os.time(tNow),os.time())
 			if bMatch then
 				-- In window, next start is end time plus one minute.
 				next_poll = poll_start
@@ -1014,7 +1137,7 @@ function CarNetModule()
 				-- Nope, see if the car is at home location.	
 				elseif var.GetNumber('LocationHome') == 1 then
 					next_poll = pol_t[2]
-				-- Nope, check fasst poll location(s)	
+				-- Nope, check fast poll location(s)	
 				else	
 					next_poll = pol_t[3]
 					-- See if we are at a fast poll location
@@ -1039,15 +1162,17 @@ function CarNetModule()
 		end
 		-- See if the schedule pushed us into no poll window. Then skip until end of window.
 		if (poll_start ~= 0 and poll_end ~= 0 and next_poll > poll_end) then next_poll = poll_start end
+		if (next_poll < 0) then next_poll = next_poll + 86400 end
 		if (next_poll == 0) then next_poll = 3600 end
 		log.Debug("Next poll time in "..next_poll .. " seconds.")
 		return next_poll
 	end
 			
-	-- Trigger an update of the car status by sending RequestVsr now
+	-- Trigger an update of the car status by sending RequestVsr now. Polling will pickup on update.
 	local function _poll()
 		log.Debug("Poll, enter")
-		CarNet_UpdateStatus('loop', true)
+		_command('getRequestVsr')
+--		CarNet_UpdateStatus('loop', true)
 	end
 	
 	local function _start_action(request)
@@ -1064,6 +1189,7 @@ function CarNetModule()
 		UpdateCarStatus = _update_car_status,
 		UpdateCarLocation = _update_car_location,
 		UpdateCarEManager = _update_car_emanager,
+		UpdateVehicleDetails = _update_vehicle_details,
 		CalculateNextPoll = _calculate_next_poll,
 		SetStatusMessage = _set_status_message,
 		Initialize = _init
@@ -1089,128 +1215,81 @@ function CarNet_VariableChanged(lul_device, lul_service, lul_variable, lul_value
 	end
 end
 
--- Global routine for polling car status. First send RequestVsr and then wait for updated status response.
-function CarNet_UpdateStatus(request, noSched)
+-- Global routine for polling car status. Use status from CarNet web service. Car will send updates as needed.
+function CarNet_UpdateStatus()
 	local deb_res = ''
-	log.Debug("CarNet_UpdateStatus, enter for " .. request)
+
+	-- Schedule next poll
+	luup.call_delay("CarNet_UpdateStatus", myModule.CalculateNextPoll())
+
+	log.Debug("CarNet_UpdateStatus, enter")
 	-- After 24 hrs we do a getFullyLoadedCars command again
 	local lfp = os.time() - var.GetNumber('LastFLCPoll')
-	if request == 'loop' and lfp >  86400 and (not noSched) then
+	if lfp >  86400 then
 		myModule.SetStatusMessage('Refreshing FLC...')
 		-- Get high level car end CatNet subscription details, run this once a day
-		cde, res = myModule.Command('getFullyLoadedCars')
-		if cde == 200 then
-			log.Debug('getFullyLoadedCars result : '..res)
-			local rjs = json.decode(res)
-			if rjs.errorCode == "0" then
-				if myModule.UpdateCarDetails(rjs) then 
-					var.Set('LastFLCPoll', os.time())
-				else
-					deb_res = 'getFullyLoadedCars failed reading data : '..res
-				end
-			end
-		else
-			deb_res = 'getFullyLoadedCars failed result : '.. res
+		local stat, deb_res = myModule.UpdateCarDetails()
+		if stat then
+			log.Debug('getFullyLoadedCars succeeded')
+			var.Set('LastFLCPoll', os.time())
+		else	
+			log.Debug('getFullyLoadedCars error : '..deb_res)
 		end
-		-- Next update car details in a bit
-		luup.call_delay("CarNet_UpdateStatus", math.floor(pD.PollDelay/3), 'loop')
-	elseif request == 'loop' then
-		-- Schedule next update request unless we should not (for ad-hoc Poll)
-		if (not noSched) then
-			local next_pol = myModule.CalculateNextPoll()
-			luup.call_delay("CarNet_UpdateStatus", next_pol, 'loop') 
-		end
-		
-		-- See if we have a pending request that started less than five minutes ago. Do not start a second one.
-		if (os.time() - pD.lastVsrReqStarted) < 120 then
-			log.Debug("CarNet_UpdateStatus, we have a double request within two minutes. Not starting a new.")
-			return
-		end	
-		myModule.SetStatusMessage('Refreshing status...')
-		
-		-- Send update request to car, then wait 30 seconds to see if we have a result
-		pD.lastVsrReqStarted = os.time()
-		local cde, res = myModule.Command('getRequestVsr')
-		if cde == 200 then
-			log.Debug('getRequestVsr result : '..res)
-			local rjs = json.decode(res) 
-			if rjs.errorCode == '0' then 
-				var.Set('StatusText','Update Car Status in progress....')
-				luup.call_delay("CarNet_UpdateStatus", pD.PollDelay, 'poll0') 
-			else
-				deb_res = 'Update Car Status request failed : '..res
-			end
-		else
-			deb_res = 'Update Car Status request failed : '..res
-		end
-	elseif request:sub(1,4) == 'poll' then
-		-- Try up to five poll requests 30 seconds apart
-		local npoll = tonumber(request:sub(-1) or 4)
-		if npoll < 4 then
-			var.Set('StatusText','Update Car Status in progress....'..npoll)
-			local cde, res = myModule.Command('getVsr')
-			if cde == 200 then
-				log.Debug('getVsr result : '..res)
-				local rjs = json.decode(res) 
-				if rjs.errorCode == '0' then 
-					local status = rjs.vehicleStatusData.requestStatus
-					if status == 'REQUEST_IN_PROGRESS' then
-						luup.call_delay("CarNet_UpdateStatus", pD.PollDelay, 'poll'..(npoll + 1)) 
-					elseif status == 'REQUEST_SUCCESSFUL' then
-						-- Refresh VSR status	
-						myModule.UpdateCarStatus(rjs)
-						
-						-- Next get car location long-lat.
-						cde, res = myModule.Command('getLocation')
-						if cde == 200 then
-							log.Debug('getLocation result : '..res)
-							local rjs = json.decode(res)
-							if rjs.errorCode == "0" then
-								myModule.UpdateCarLocation(rjs)
-							end
-						else
-							log.Debug('getLocation failed result : '..res)
-						end
-						-- If we have eManager, get its status
-						if var.Get('EManager') == '1' then
-							local cde, res = myModule.Command('getEManager')
-							if cde == 200 then
-								log.Debug('getEManager result : '..res)
-								local rjs = json.decode(res)
-								if rjs.errorCode == "0" then
-									myModule.UpdateCarEManager(rjs)
-								end
-							else
-								log.Debug('getEManager failed result : '..res)
-							end
-						end
-						myModule.SetStatusMessage()
-						var.Set('StatusText','Update Car Status complete.')
-						local pc = var.GetNumber("PollOk", pD.SIDS.ZW) + 1
-						var.Set("PollOk", pc, pD.SIDS.ZW)
-						pD.lastVsrReqStarted = 0
-					else
-						-- Late/rogue getVsr response without status
-						deb_res = 'Update Car Status finished.'
-						pD.lastVsrReqStarted = 0
-					end	
-				else
-					deb_res = 'getVsr failed result : '..res
-				end	
-			else
-				deb_res = 'getVsr failed result : '..res
-			end
-		else
-			deb_res = 'getVsr did not return a REQUEST_SUCCESSFULL withing 120 seconds.'
+	end	
+	if deb_res == "" then
+		myModule.SetStatusMessage('Refreshing Car status...')
+		var.Set('StatusText','Update Car Status in progress....')
+		local stat, deb_res = myModule.UpdateCarStatus()
+		if stat then
+			log.Debug('RequestStatus succeeded')
+		else	
+			log.Debug('RequestStatus error : '..deb_res)
 		end
 	end
+					
+	-- Next get car location long-lat.
+	if deb_res == "" then
+		local stat, deb_res = myModule.UpdateCarLocation()
+		if stat then
+			log.Debug('UpdateCarLocation succeeded')
+		else	
+			log.Debug('UpdateCarLocation error : '..deb_res)
+		end
+	end
+
+	-- Next get car details.
+	if deb_res == "" then
+		local stat, deb_res = myModule.UpdateVehicleDetails()
+		if stat then
+			log.Debug('UpdateVehicleDetails succeeded')
+		else	
+			log.Debug('UpdateVehicleDetails error : '..deb_res)
+		end
+	end
+
+	-- If we have eManager, get its status
+	if deb_res == "" then
+		if var.Get('EManager') == '1' then
+			local stat, deb_res = myModule.UpdateCarEManager()
+			if stat then
+				log.Debug('UpdateCarEManager succeeded')
+			else	
+				log.Debug('UpdateCarEManager error : '..deb_res)
+			end
+		end
+	end
+	myModule.SetStatusMessage()
 	if deb_res ~= '' then
 		local pc = var.GetNumber("PollNoReply", pD.SIDS.ZW) + 1
 		var.Set("PollNoReply", pc, pD.SIDS.ZW)
-		var.Set('StatusText',deb_res:sub(1,50))
+		var.Set('StatusText',deb_res:sub(1,80))
 		log.Debug(deb_res)
 		log.Log(deb_res,5)
 		myModule.SetStatusMessage()
+	else
+		var.Set('StatusText','Update Car Status complete.')
+		local pc = var.GetNumber("PollOk", pD.SIDS.ZW) + 1
+		var.Set("PollOk", pc, pD.SIDS.ZW)
 	end
 	log.Debug("CarNet_UpdateStatus, leave")
 end
@@ -1402,31 +1481,27 @@ function CarNet_PollEManager()
 	log.Debug("CarNet_PollEManager, enter")
 	
 	-- See if request is one of the commands
-	local cde, res = myModule.Command('getEManager')
-	if cde == 200 then
-		log.Debug('getEManager result : '..res)
-		local rjs = json.decode(res)
-		if rjs.errorCode == "0" then
-			local rem_time = myModule.UpdateCarEManager(rjs)
-			local pol = var.Get("PollSettings")
-			local cs = var.GetNumber("ChargeStatus")
-			local cls= var.GetNumber("ClimateStatus")
-			local ws = var.GetNumber("WindowMeltStatus")
-			local pol_t = {}
-			string.gsub(pol..",","(.-),", function(c) pol_t[#pol_t+1] = c end)
-			if #pol_t == 4 then 
-				-- If an action is active and we have remaining time continue to poll
-				if cs == 1 or cls == 1 or sw == 1 then 
-					log.Debug('Schedule CarNet_PollEManager : '..tonumber(pol_t[1]) * 60)
-					luup.call_delay("CarNet_PollEManager", tonumber(pol_t[1]) * 60)
-				else	
-					myModule.SetStatusMessage()
-				end
+	local status, res = myModule.UpdateCarEManager()
+	if status then
+		log.Debug('getEManager succeeded')
+		local pol = var.Get("PollSettings")
+		local cs = var.GetNumber("ChargeStatus")
+		local cls= var.GetNumber("ClimateStatus")
+		local ws = var.GetNumber("WindowMeltStatus")
+		local pol_t = {}
+		string.gsub(pol..",","(.-),", function(c) pol_t[#pol_t+1] = c end)
+		if #pol_t > 1 then 
+			-- If an action is active and we have remaining time continue to poll
+			if cs == 1 or cls == 1 or sw == 1 then 
+				log.Debug('Schedule CarNet_PollEManager : '..tonumber(pol_t[1]) * 60)
+				luup.call_delay("CarNet_PollEManager", tonumber(pol_t[1]) * 60)
+			else	
+				myModule.SetStatusMessage()
 			end
 		end
 	else
 		myModule.SetStatusMessage()
-		log.Debug('getEManager failed result : '..res)
+		log.Debug('UpdateEManager failed result : '..res)
 	end
 	log.Debug("CarNet_PollEManager, leave")
 end
@@ -1474,7 +1549,7 @@ function CarNetModule_Initialize()
 	luup.variable_watch('CarNet_VariableChanged', pD.SIDS.MODULE, "LogLevel", pD.DEV)
 		
 	-- Start polling loop
-	luup.call_delay("CarNet_UpdateStatus", 36, "loop")
+	luup.call_delay("CarNet_UpdateStatus", 36)
 
 	log.Log("CarNetModule_Initialize finished ",10)
 	luup.set_failure(0, pD.DEV)
