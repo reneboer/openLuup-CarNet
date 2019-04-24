@@ -2,8 +2,10 @@
 	Module L_CarNet1.lua
 	
 	Written by R.Boer. 
-	V2.2, 27 February 2019
+	V2.3, 24 April 2019
 	
+	V2.3 changes:
+			- Doors lockData logic changed by VW. Changed to match.
 	V2.2 changes:
 			- Added get-vehicle-details to polling loop as some details are no longer in get-vsr.
 	V2.1.1 changes:
@@ -819,9 +821,10 @@ function CarNetModule()
 							end
 						end	
 					end
-					-- Locks status 3 should be locked, 2 unlocked
+					-- V2.3, VW changed logic to match other items.
+					-- Locks status 2 should be locked, 3 unlocked
 					if vsd.lockData then
-						local txt =	buildStatusText(vsd.lockData, n_doors, 2)
+						local txt = buildStatusText(vsd.lockData, n_doors, 3)
 						if txt then
 							var.Set('LocksStatus', txt..'unlocked')
 							var.Set('IconSet',3)
