@@ -32,7 +32,7 @@ local https     = require("ssl.https")
 local http		= require("socket.http")	 -- V1.6
 
 local pD = {
-	Version = '2.2',
+	Version = '2.3',
 	SIDS = { 
 		MODULE = 'urn:rboer-com:serviceId:CarNet1',
 		ALTUI = 'urn:upnp-org:serviceId:altui1',
@@ -824,7 +824,7 @@ function CarNetModule()
 					-- V2.3, VW changed logic to match other items.
 					-- Locks status 2 should be locked, 3 unlocked
 					if vsd.lockData then
-						local txt = buildStatusText(vsd.lockData, n_doors, 3)
+						local txt = buildStatusText(vsd.lockData, n_doors, 2)
 						if txt then
 							var.Set('LocksStatus', txt..'unlocked')
 							var.Set('IconSet',3)
