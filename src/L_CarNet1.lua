@@ -2,8 +2,10 @@
 	Module L_CarNet1.lua
 	
 	Written by R.Boer. 
-	V2.3, 24 April 2019
+	V2.4, 27 August 2019
 	
+	V2.4 changes:
+			- Updated for new WE Connect portal.
 	V2.3 changes:
 			- Doors lockData logic changed by VW. Changed to match.
 	V2.2 changes:
@@ -29,10 +31,11 @@
 local ltn12 	= require("ltn12")
 local json 		= require("dkjson")
 local https     = require("ssl.https")
-local http		= require("socket.http")	 -- V1.6
+local http		= require("socket.http")
+local url 		= require("socket.url")
 
 local pD = {
-	Version = '2.3',
+	Version = '2.4',
 	SIDS = { 
 		MODULE = 'urn:rboer-com:serviceId:CarNet1',
 		ALTUI = 'urn:upnp-org:serviceId:altui1',
@@ -157,59 +160,138 @@ end
 
 -- API to handle basic logging and debug messaging
 local function logAPI()
-local def_level = 3
+local def_level = 1
 local def_prefix = ''
 local def_debug = false
+local def_file = false
+local max_length = 100
+local onOpenLuup = false
+local taskHandle = -1
 
 	local function _update(level)
-		if level > 10 then
+		if level > 100 then
+			def_file = true
 			def_debug = true
 			def_level = 10
+		elseif level > 10 then
+			def_debug = true
+			def_file = false
+			def_level = 10
 		else
+			def_file = false
 			def_debug = false
 			def_level = level
 		end
 	end	
 
-	local function _init(prefix, level)
+	local function _init(prefix, level, onol)
 		_update(level)
 		def_prefix = prefix
+		onOpenLuup = onol
 	end	
-
-	local function _log(text, level) 
-		local level = (level or 10)
-		if (def_level >= level) then
-			if (level == 10) then level = 50 end
-			local msg = (text or "no text")
-			luup.log(def_prefix .. ": " .. msg:sub(1,60), (level or 50)) 
+	
+	-- Build loggin string safely up to given lenght. If only one string given, then do not format because of length limitations.
+	local function prot_format(ln,str,...)
+		local msg = ""
+		local sf = string.format
+		if arg[1] then 
+			_, msg = pcall(sf, str, unpack(arg))
+		else 
+			msg = str or "no text"
+		end 
+		if ln > 0 then
+			return msg:sub(1,ln)
+		else
+			return msg
+		end	
+	end	
+	local function _log(...) 
+		if (def_level >= 10) then
+			luup.log(def_prefix .. ": " .. prot_format(max_length,...), 50) 
 		end	
 	end	
 	
-	local function _debug(text)
+	local function _info(...) 
+		if (def_level >= 8) then
+			luup.log(def_prefix .. "_info: " .. prot_format(max_length,...), 8) 
+		end	
+	end	
+
+	local function _warning(...) 
+		if (def_level >= 2) then
+			luup.log(def_prefix .. "_warning: " .. prot_format(max_length,...), 2) 
+		end	
+	end	
+
+	local function _error(...) 
+		if (def_level >= 1) then
+			luup.log(def_prefix .. "_error: " .. prot_format(max_length,...), 1) 
+		end	
+	end	
+
+	local function _debug(...)
 		if def_debug then
-			luup.log(def_prefix .. "_debug: " .. (text or "no text"), 50) 
+			luup.log(def_prefix .. "_debug: " .. prot_format(-1,...), 50) 
 		end	
 	end
 	
+	-- Write to file for detailed analisys
+	local function _logfile(...)
+		if def_file then
+			local fh = io.open("/tmp/carnet.log","a")
+			local msg = os.date("%d/%m/%Y %X") .. ": " .. prot_format(-1,...)
+			fh:write(msg)
+			fh:write("\n")
+			fh:close()
+		end	
+	end
+	
+	local function _devmessage(devID, isError, timeout, ...)
+		local message =  prot_format(60,...)
+		local status = isError and 2 or 4
+		-- Standard device message cannot be erased. Need to do a reload if message w/o timeout need to be removed. Rely on caller to trigger that.
+		if onOpenLuup then
+			taskHandle = luup.task(message, status, def_prefix, taskHandle)
+			if timeout ~= 0 then
+				luup.call_delay("logAPI_clearTask", timeout, "", false)
+			else
+				taskHandle = -1
+			end
+		else
+			luup.device_message(devID, status, message, timeout, def_prefix)
+		end	
+	end
+	
+	local function logAPI_clearTask()
+		luup.task("", 4, def_prefix, taskHandle)
+		taskHandle = -1
+	end
+	_G.logAPI_clearTask = logAPI_clearTask
+	
 	return {
 		Initialize = _init,
-		Update = _update,
+		Error = _error,
+		Warning = _warning,
+		Info = _info,
 		Log = _log,
-		Debug = _debug
+		Debug = _debug,
+		Update = _update,
+		LogFile = _logfile,
+		DeviceMessage = _devmessage
 	}
 end 
 
 -- Interfaces to system
-local function SetSessionDetails(userURL,token,sessionid)
+local function SetSessionDetails(userURL,token,cookies)
 	var.Set("userURL",(userURL or ''))
 	var.Set("Token",(token or ''))
-	var.Set("SessionID",(sessionid or ''))
+	var.Set("Cookies",(cookies or ''))
 end
 local function GetSessionDetails()
 	local userURL = var.Get("userURL")
 	local token = var.Get("Token")
-	local sessionid = var.Get("SessionID")
-	return userURL,token,sessionid
+	local cookies = var.Get("Cookies")
+	return userURL,token,cookies
 end
 
 
@@ -234,13 +316,12 @@ local function CarNetAPI()
 		['getTripStatistics'] = {url ='/-/rts/get-latest-trip-statistics' }
 	}
 	
-	local port_host = "www.volkswagen-car-net.com"
-	local HEADERS = { 
-		['accept'] = 'application/json, text/plain, */*',
-		['content-type'] = 'application/json;charset=UTF-8',
-		['user-agent'] = 'Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:57.0) Gecko/20100101 Firefox/57.0' 
-	}
-	
+	-- WE Connect portal location
+	local port_host = "www.portal.volkswagen-we.com"
+	-- We need to store cookies received per site
+	local cookie_tab = {}
+	cookie_tab[port_host] = {}
+
 	local langCodes = {
 		['NL'] = 'nl_NL',
 		['GB'] = 'en_GB',
@@ -287,29 +368,100 @@ local function CarNetAPI()
 		return (langCodes[cc] or 'en_GB')
 	end	
 	
+	-- Get all parameters from the URL, or just the one specified
+	local function extract_url_parameters(url,key)
+		local function urldecode(s)
+			local sc = string.char
+			s = s:gsub('+', ' '):gsub('%%(%x%x)', function(h)
+				return sc(tonumber(h, 16))
+				end)
+		return s
+		end
+	
+		local ans = {}
+		for k,v in url:gmatch('([^&=?]-)=([^&=?]+)' ) do
+			if key then
+				if k == key then
+					return urldecode(v)
+				end
+			else
+				ans[ k ] = urldecode(v)
+			end
+		end
+		if key then
+			return ''
+		else	
+			return ans
+		end	
+	end
+
 	-- Handle post header x-www-form-urlencoded encoding
 	local function _postencodepart(s)
 		return s and (s:gsub("%W", function (c)
-			if c ~= "." and c ~= "_" then
-				return string.format("%%%02X", c:byte());
+			local sf = string.format
+			if c ~= "." and c ~= "_" and c ~= "-" then
+				return sf("%%%02X", c:byte());
 			else
 				return c;
 			end
 		end));
 	end
 	local function postencode(p_data)
+		local ti = table.insert
+		local tc = table.concat
 		local result = {};
 		if p_data[1] then -- Array of ordered { name, value }
 			for _, field in ipairs(p_data) do
-				table.insert(result, _postencodepart(field[1]).."=".._postencodepart(field[2]));
+				ti(result, _postencodepart(field[1]).."=".._postencodepart(field[2]));
 			end
 		else -- Unordered map of name -> value
 			for name, value in pairs(p_data) do
-				table.insert(result, _postencodepart(name).."=".._postencodepart(value));
+				ti(result, _postencodepart(name).."=".._postencodepart(value));
 			end
 		end
-		return table.concat(result, "&");
+		return tc(result, "&");
 	end
+	
+	-- Parse cookie-set and store cookies
+	local function cookies_parse(cookie_tab, cookies)
+		local sm = string.match
+		local sg = string.gsub
+		local sgm = string.gmatch
+		local cookies = sg(cookies, "Expires=(.-); ", "")
+		for cookie in sgm(cookies..',','(.-),') do
+			local key,val,pth = sm(cookie..";", '(.-)=(.-); [P|p]ath=(.-);')
+			key = sg(key," ","")
+			if pth == "/" then pth = "" end
+			cookie_tab[key..pth] = val
+		end
+	end
+
+	-- Get the value of a given cookie on path
+	local function cookies_get(cookie_tab,key,pth)
+		return cookie_tab[(key or "XxXx")..(pth or "")] or ''
+	end
+
+	-- Build a cookie string for the given cookie keys/paths
+	local function cookies_build(cookie_tab,...)
+		local sm = string.match
+		local keys = {...}
+		local cookies = ''
+		for _, key in ipairs(keys) do
+			local kv, kp = sm(key,"(.-)(/.*)")
+			if not kv then kv = key end
+			local val = cookies_get(cookie_tab,kv,kp)
+			-- Only add if we know the cookie
+			if val ~= '' then
+				if cookies == '' then
+					cookies = kv.."="..val
+				else
+					cookies = cookies.."; "..kv.."="..val
+				end    
+			end	
+		end
+		return cookies
+	end
+
 	-- HTTPs Get request
 	local function HttpsGet(strURL,ReqHdrs)
 		local result = {}
@@ -328,8 +480,9 @@ local function CarNetAPI()
 	local function HttpsPost(strURL,ReqHdrs,PostData)
 		local result = {}
 		local request_body = nil
-log.Debug("HttpsPost 1 "..strURL)		
+log.Debug("HttpsPost 1 %s", strURL)		
 		if PostData then
+			local sl = string.len
 			-- We pass JSONs as string as they are simple in this application
 			if type(PostData) == 'string' then
 				ReqHdrs["content-type"] = 'application/json;charset=UTF-8'
@@ -338,8 +491,8 @@ log.Debug("HttpsPost 1 "..strURL)
 				ReqHdrs["content-type"] = 'application/x-www-form-urlencoded'
 				request_body=postencode(PostData)
 			end
-			ReqHdrs["content-length"] = string.len(request_body)
-log.Debug("HttpsPost 2 "..request_body)		
+			ReqHdrs["content-length"] = sl(request_body)
+log.Debug("HttpsPost 2 body: %s",request_body)		
 		else	
 log.Debug("HttpsPost 2, no body ")		
 			ReqHdrs["content-length"] = '0'
@@ -352,7 +505,7 @@ log.Debug("HttpsPost 2, no body ")
 			source = ltn12.source.string(request_body),
 			headers = ReqHdrs
 		}
-log.Debug("HttpsPost 3 "..cde)		
+log.Debug("HttpsPost 3 %d", cde)		
 		return bdy,cde,hdrs,result
 	end	
 
@@ -372,185 +525,313 @@ log.Debug("HttpsPost 3 "..cde)
 
 	-- Login to portal
 	local function _portal_login(email, password, cc)
-		log.Debug('Enter PortalLogin :'.. email)
+		log.Debug('Enter PortalLogin : %s', email)
+		local sec_host = 'identity.vwgroup.io'
+		local bdy,cde,hdrs,result
+		local sf = string.format
+		local sm = string.match
+		local sg = string.gsub
+		local ss = string.sub
+		local sl = string.len
+		local tc = table.concat
 
-		local sec_host = 'security.volkswagen.com'
-		local bdy,cde,hdrs,result,ref_url, lg_url
-		local cookie_Init = ''
-		local cookie_JS = ''
-		local isoLC = _getlanguacode(cc)
-		
-		-- Fixed URLs to use in order
+		-- The different URL formatters to use
 		local URLS = { 
-			'https://' .. port_host .. '/portal/'..isoLC..'/web/guest/home', 
-			'https://' .. port_host .. '/portal/'..isoLC..'/web/guest/home/-/csrftokenhandling/get-login-url',
-			'https://' .. sec_host  .. '/ap-login/jsf/login.jsf',
-			'https://' .. port_host .. '/portal/'..isoLC..'/web/guest/complete-login'
+			'https://%s/portal', 
+			'https://%s/portal/%s/web/guest/home', 
+			'https://%s/portal/%s/web/guest/home/-/csrftokenhandling/get-login-url',
+			'https://%s/signin-service/v1/%s/login/identifier',
+			'https://%s/signin-service/v1/%s/login/authenticate',
+			'https://%s/portal/web/guest/complete-login?p_auth=%s&p_p_id=33_WAR_cored5portlet&p_p_lifecycle=1&p_p_state=normal&p_p_mode=view&p_p_col_id=column-1&p_p_col_count=1&_33_WAR_cored5portlet_javax.portlet.action=getLoginStatus'
 		}
-		-- Base Headers to start with
-		local AUTHHEADERS = {
-			['host'] = port_host,
-			['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-			['accept-language'] = 'en-US,en;q=0.5',
-			['user-agent'] = 'Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:57.0) Gecko/20100101 Firefox/57.0', 
-			['connection'] = 'keep-alive',
-			['upgrade-insecure-requests'] = '1'
-		}
-
-		-- Clone header table so we can start over as needed
-		local function header_clone(orig)
-			local copy
-			if type(orig) == 'table' then
-				copy = {}
-				for orig_key, orig_value in pairs(orig) do
-					copy[orig_key] = orig_value
-				end
-			else -- number, string, boolean, etc
-				copy = orig
-			end
-			return copy
-		end
+		local user_agent = 'Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:57.0) Gecko/20100101 Firefox/57.0'
+		local isoLC = _getlanguacode(cc)
+		-- Need seperate cookie list for sec_host
+		cookie_tab[sec_host] = {}
 		
-		-- Request landing page and get CSFR Token:
-		local req_hdrs = header_clone(AUTHHEADERS)
-		-- Initial logon. E.g. "https://www.volkswagen-car-net.com/portal/nl_NL/web/guest/home"
-		bdy,cde,hdrs,result = HttpsGet(URLS[1],req_hdrs)
+		-- Step 1
+		log.Debug("Step 1 ===========")
+		-- Request landing page and get CSFR Token and JSESSIONID cookie:
+		local req_hdrs = {
+			['host'] = port_host,
+			['accept'] = '*/*',
+			['accept-encoding'] = 'identity',
+			['user-agent'] = user_agent,
+			['connection'] = 'keep-alive'
+		}
+		local landing_page_url = sf(URLS[2], port_host, isoLC)
+		bdy,cde,hdrs,result = HttpsGet(landing_page_url, req_hdrs)
 		if cde ~= 200 then return '', '1', 'Incorrect response code ' .. cde .. ' expect 200' end
 		if (hdrs and hdrs['set-cookie']) then 
-			cookie_JS = string.match(hdrs['set-cookie'],'JSESSIONID=([%w%.]+); Path=')
-		if cookie_JS then
-				cookie_Init = 'JSESSIONID='.. cookie_JS ..'; GUEST_LANGUAGE_ID='..isoLC..'; COOKIE_SUPPORT=true; CARNET_LANGUAGE_ID='..isoLC..'; VW_COOKIE_AGREEMENT=true'
-			end	
+			cookies_parse(cookie_tab[req_hdrs['host']], hdrs['set-cookie'])
 		end
+		if cookies_get(cookie_tab[req_hdrs['host']], "JSESSIONID") == '' then return '', '1.1', 'Did not get JSESSIONID cookie' end
 		-- Get x-csrf-token from html result
-		local csrf = string.match(result[1],'<meta name="_csrf" content="(%w+)"/>')
-		if not csrf then return '', '1.2', 'No token found' end
+		local csrf = sm(result[1],'<meta name="_csrf" content="(%w+)"/>')
+		if not csrf then return '', '1.2', 'No X-CSRF token found' end
+		log.Debug('_csrf from landing page : %s', csrf)
 
-		-- Get login page. E.g. "https://www.volkswagen-car-net.com/portal/nl_NL/web/guest/home/-/csrftokenhandling/get-login-url"
-		req_hdrs['referer'] = URLS[1]
-		req_hdrs['x-csrf-token'] = csrf
-		req_hdrs['accept'] = 'application/json, text/plain, */*'
-		req_hdrs['cookie'] = cookie_Init
-		bdy,cde,hdrs,result = HttpsPost(URLS[2],req_hdrs)
+		-- Step 2
+		log.Debug("Step 2 ===========")
+		-- Get login page. E.g. "https://[port_host]/portal/nl_NL/web/guest/home/-/csrftokenhandling/get-login-url"
+		req_hdrs = {
+			['host'] = port_host,
+			['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+			['accept-encoding'] = 'identity',
+			['user-agent'] = user_agent,
+			['referer'] = sf(URLS[1], port_host),
+			['x-csrf-token'] = csrf,
+			['cookie'] = cookies_build(cookie_tab[port_host],"JSESSIONID", "LB-ID", "GUEST_LANGUAGE_ID", "COOKIE_SUPPORT", "CARNET_LANGUAGE_ID"),
+			['connection'] = 'keep-alive'
+		}
+		local get_login_url = sf(URLS[3], port_host, isoLC)
+		bdy,cde,hdrs,result = HttpsPost(get_login_url,req_hdrs)
 		if cde ~= 200 then return '', '2', 'Incorrect response code ' .. cde .. ' expect 200' end
-		local responseData = json.decode(table.concat(result))
-		lg_url = responseData.loginURL.path
-		if not lg_url then return '', '2.1', 'Missing redirect location in response' end
-
-		-- Get oauth2 page. E.g. "https://security.volkswagen.com/as/authorization.oauth2?apTargetResource...."
-		req_hdrs = header_clone(AUTHHEADERS)
-		if not userURL then req_hdrs['referer'] = URLS[1] end
-		req_hdrs['cookie'] = 'PF=CZXp7A7tbc0Cn6Af6Fu4eP' -- Dummy value
-		req_hdrs['accept-encoding'] = 'gzip, deflate, br'
-		req_hdrs['host'] = sec_host
-		-- stops here unless you install luasec 0.7 as SNI is not supported by luasec 0.5 or 0.6. Show stopper for Vera it seems.
-		bdy,cde,hdrs,result = HttpsGet(lg_url,req_hdrs)
-		local cookie_PF = ''
 		if (hdrs and hdrs['set-cookie']) then 
-			cookie_PF = string.match(hdrs['set-cookie'],'PF=(%w+);')
+			cookies_parse(cookie_tab[req_hdrs['host']], hdrs['set-cookie'])
 		end
-		if cde ~= 302 then return '', '3', 'Incorrect response code ' .. cde .. ' expect 302'   end
-		ref_url = hdrs.location
-		if not ref_url then return '', '3.1', 'Missing redirect location in return header' end
+		local responseData = json.decode(tc(result))
+		local login_url = responseData.loginURL.path
+		if not login_url then return '', '2.1', 'Missing redirect location in response' end
+		login_url = sg(login_url, " ", "%%20")
+		local client_id = extract_url_parameters(login_url, 'client_id')
+		if not client_id then return '', '2.2', 'Failed to get client_id' end
+		log.Debug("client_id found: %s", client_id)
 	
-		-- now get actual login page and get session id and ViewState. E.g. "https://security.volkswagen.com/ap-login/jsf/login.jsf?resume=/as...."
-		req_hdrs = header_clone(AUTHHEADERS)
-		if userURL then 
-			req_hdrs['cookie'] = 'PF='..cookie_PF
-		else	
-			req_hdrs['referer'] = URLS[1] 
-			req_hdrs['cookie'] = 'JSESSIONID='.. cookie_JS ..'; PF='..cookie_PF
+		-- Step 3
+		log.Debug("Step 3 ===========")
+		-- Get login form url we are told to use, it will give us a new location.
+		req_hdrs = {
+			['host'] = sec_host,
+			['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+			['accept-encoding'] = 'gzip, deflate, br',
+			['user-agent'] = user_agent,
+			['referer'] = sf(URLS[1], port_host),
+			['x-csrf-token'] = csrf,
+			['connection'] = 'keep-alive'
+		}
+		-- stops here unless you install luasec 0.7 as SNI is not supported by luasec 0.5 or 0.6. Show stopper for Vera it seems.
+		bdy,cde,hdrs,result = HttpsGet(login_url,req_hdrs)
+		if cde ~= 302 then return '', '3', 'Incorrect response code ' .. cde .. ' expect 302'   end
+		if (hdrs and hdrs['set-cookie']) then 
+			cookies_parse(cookie_tab[req_hdrs['host']], hdrs['set-cookie'])
 		end
-		req_hdrs['host'] = sec_host
-		bdy,cde,hdrs,result = HttpsGet(ref_url,req_hdrs)
+		if cookies_get(cookie_tab[req_hdrs['host']], "JSESSIONID", "/oidc") == '' then return '', '3.1', 'Did not get JSESSIONID cookie' end
+		local login_form_url = hdrs.location
+		if not login_form_url then return '', '3.2', 'Missing redirect location in return header' end
+		local login_relay_state_token = extract_url_parameters(login_form_url, 'relayState')
+		if not login_relay_state_token then return '', '3.3', 'Failed to get relayState' end
+		log.Debug("relayState found: %s", login_relay_state_token)
+	
+		-- Step 4
+		log.Debug("Step 4 ===========")
+		-- Get login action url, relay state. hmac token 1 and login CSRF from form contents
+		req_hdrs = {
+			['host'] = sec_host,
+			['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+			['accept-encoding'] = 'identity',
+			['user-agent'] = user_agent,
+			['referer'] = sf(URLS[1], port_host),
+			['x-csrf-token'] = csrf,
+			['cookie'] = cookies_build(cookie_tab[sec_host], "accept-language", "vcap_journey"),
+			['connection'] = 'keep-alive'
+		}
+		bdy,cde,hdrs,result = HttpsGet(login_form_url,req_hdrs)
 		if cde ~= 200 then return '', '4', 'Incorrect response code ' .. cde .. ' expect 200'   end
 		if (hdrs and hdrs['set-cookie']) then 
-			cookie_JS = string.match(hdrs['set-cookie'],'JSESSIONID=([%w%.]+); Path=')
+			cookies_parse(cookie_tab[req_hdrs['host']], hdrs['set-cookie'])
 		end
-		local view_state = string.match(table.concat(result),'name="javax.faces.ViewState" id="j_id1:javax.faces.ViewState:0" value="([%-:0-9]+)"')
-		if not view_state then return '', '4.1', 'Missing ViewState in result'  end
+		if cookies_get(cookie_tab[req_hdrs['host']], "SESSION", "/signin-service/v1/") == '' then return '', '4.1', 'Did not get SESSION cookie' end
+		-- Get hmac and csrf tokens from form content.
+		local login_form_location_response_data = tc(result)
+		local hmac_token1 = sm(login_form_location_response_data,'<input type="hidden" id="hmac" name="hmac" value="(.-)"/>')
+		local login_csrf = sm(login_form_location_response_data,'<input type="hidden" id="csrf" name="_csrf" value="(.-)"/>')
+		if not login_csrf then return '', '4.2', 'Failed to get login CSRF'  end
+		if not hmac_token1 then return '', '4.3', 'Failed to get  1st HMAC token'  end
+		log.Debug("login_csrf found: %s", login_csrf)
+		log.Debug("hmac_token1 found: %s", hmac_token1)
 
-		-- Submit login details
-		req_hdrs = header_clone(AUTHHEADERS)
-		req_hdrs['accept'] = '*/*'
-		req_hdrs['faces-request'] = 'partial/ajax'
-		req_hdrs['referer'] = ref_url
-		req_hdrs['cookie'] = 'JSESSIONID='.. cookie_JS ..'; PF='..cookie_PF
-		req_hdrs['host'] = sec_host
-
+		-- Step 5
+		-- Post login identifier (email)
+		log.Debug("Step 5 ===========")
+		req_hdrs = {
+			['host'] = sec_host,
+			['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+			['accept-encoding'] = 'gzip, deflate, br',
+			['user-agent'] = user_agent,
+			['referer'] = login_form_url,
+			['cookie'] = cookies_build(cookie_tab[sec_host], "SESSION/signin-service/v1/"),
+			['connection'] = 'keep-alive'
+		}
 		local post_data = { 
-			{'loginForm', 'loginForm'},
-			{'loginForm:email', (email or '')},
-			{'loginForm:password', (password or '')},
-			{'loginForm:j_idt19', ''},
-			{'javax.faces.ViewState', (view_state or '')},
-			{'javax.faces.source', 'loginForm:submit'},
-			{'javax.faces.partial.event', 'click'},
-			{'javax.faces.partial.execute', 'loginForm:submit loginForm'},
-			{'javax.faces.partial.render', 'loginForm'},
-			{'javax.faces.behavior.event', 'action'},
-			{'javax.faces.partial.ajax','true'}
+			{'email', email},
+			{'relayState', login_relay_state_token},
+			{'hmac', hmac_token1},
+			{'_csrf', login_csrf}
 		}
-	
-		bdy,cde,hdrs,result = HttpsPost(URLS[3], req_hdrs, post_data)
-		if cde ~= 200 then return '', '5', 'Incorrect response code ' .. cde .. ' expect 200' end
-		local cookie_SO = ''
-		if (hdrs and hdrs['set-cookie']) then 
-			cookie_SO = string.match(hdrs['set-cookie'],'SsoProviderCookie=(.+); Domain=.volkswagen.com;')
+		local login_action_url = sf(URLS[4], sec_host, client_id)
+		bdy,cde,hdrs,result = HttpsPost(login_action_url, req_hdrs, post_data)
+		if cde ~= 303 then return '', '5', 'Incorrect response code ' .. cde .. ' expect 303' end
+		if not hdrs.location then return '', '5.1', 'Missing redirect location in return header' end
+		if ss(hdrs.location, 1, sl('https://'..sec_host)) ~= 'https://'..sec_host then
+			login_action_url = 'https://'..sec_host..hdrs.location
+		else
+			login_action_url = hdrs.location
 		end
-		if not cookie_SO then return '', '5.1', 'Missing SsoProviderCookie in return set-cookie' end
-		local ref_url1 =string.gsub(string.match(table.concat(result),'<redirect url="([^"]*)"></redirect>'),'&amp;','&')
-		if not ref_url1 then return '', '5.2', 'Missing redirect location in result'  end
+		-- Step 5.1
+		-- Get redirect location
+		log.Debug("Step 5.1")
+		req_hdrs = {
+			['host'] = sec_host,
+			['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+			['accept-encoding'] = 'identity',
+			['user-agent'] = user_agent,
+			['referer'] = login_form_url,
+			['cookie'] = cookies_build(cookie_tab[sec_host], "SESSION/signin-service/v1/", "vcap_journey"),
+			['connection'] = 'keep-alive'
+		}
+		bdy,cde,hdrs,result = HttpsGet(login_action_url,req_hdrs)
+		if cde ~= 200 then return '', '5.2', 'Incorrect response code ' .. cde .. ' expect 200' end
+		local login_form_location_response_data = tc(result)
+		local hmac_token2 = sm(login_form_location_response_data,'<input type="hidden" id="hmac" name="hmac" value="(.-)"/>')
+		if not hmac_token2 then return '', '5.3', 'Failed to get 2nd HMAC token'  end
+		log.Debug("hmac_token2 found: %s", hmac_token2)
 
-		-- Call authorization. E.g. "https://security.volkswagen.com/as/WkHwr/resume/as/authorization.ping?apTarge....."
-		req_hdrs = header_clone(AUTHHEADERS)
-		req_hdrs['cookie'] = 'PF='..cookie_PF..'; SsoProviderCookie='..cookie_SO
-		req_hdrs['accept-encoding'] = 'gzip, deflate, br'
-		req_hdrs['referer'] = ref_url
-		req_hdrs['host'] = sec_host
-		bdy,cde,hdrs,result = HttpsGet(ref_url1,req_hdrs)
+		-- Step6
+		-- Post login authenticate
+		log.Debug("Step 6 ===========")
+		req_hdrs = {
+			['host'] = sec_host,
+			['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+			['accept-encoding'] = 'gzip, deflate, br',
+			['user-agent'] = user_agent,
+			['referer'] = sf(URLS[4], sec_host, client_id),
+			['cookie'] = cookies_build(cookie_tab[sec_host], "SESSION/signin-service/v1/", "vcap_journey"),
+			['connection'] = 'keep-alive'
+		}
+		local post_data = { 
+			{'relayState', login_relay_state_token},
+			{'hmac', hmac_token2},
+			{'_csrf', login_csrf},
+			{'login','true'},
+			{'password', password},
+			{'email', email}
+		}
+		login_action_url = sf(URLS[5], sec_host, client_id)
+		bdy,cde,hdrs,result = HttpsPost(login_action_url, req_hdrs, post_data)
 		if cde ~= 302 then return '', '6', 'Incorrect response code ' .. cde .. ' expect 302' end
-		local ref_url2 = hdrs.location
-		if not ref_url2 then return '', '6.1', 'Missing redirect location in return header' end
-		local code = string.match(ref_url2,'code=([^"]*)&')
-
-		-- Next step. E.g. "https://www.volkswagen-car-net.com/portal/nl_NL/web/guest/complete-login?...."
-		req_hdrs = header_clone(AUTHHEADERS)
-		req_hdrs['referer'] = ref_url
-		req_hdrs['accept-encoding'] = 'gzip, deflate, br'
-		bdy,cde,hdrs,result = HttpsGet(ref_url2,req_hdrs)
-		if cde ~= 200 then return '', '7', 'Incorrect response code ' .. cde .. ' expect 200' end
-	
-		-- Complete last login step. E.g. "https://www.volkswagen-car-net.com/portal/nl_NL/web/guest/complete-login?p_auth=...."
-		req_hdrs = header_clone(AUTHHEADERS)
-		req_hdrs['referer'] = ref_url2
-		req_hdrs['cookie'] = cookie_Init
-		req_hdrs['accept-encoding'] = 'gzip, deflate, br'
-		post_data = { 
-			{'_33_WAR_cored5portlet_code', code },
-			{'_33_WAR_cored5portlet_landingPageUrl', ''}
+		if not hdrs.location then return '', '6.1', 'Missing redirect location in return header' end
+		-- Step 6.1
+		log.Debug("Step 6.1")
+		req_hdrs = {
+			['host'] = sec_host,
+			['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+			['accept-encoding'] = 'gzip, deflate, br',
+			['user-agent'] = user_agent,
+			['referer'] = sf(URLS[4], sec_host, client_id),
+			['cookie'] = cookies_build(cookie_tab[sec_host], "JSESSIONID/oidc", "__VCAP_ID__/oidc", "vcap_journey"),
+			['connection'] = 'keep-alive'
 		}
-		bdy,cde,hdrs,result = HttpsPost(URLS[4].. '?p_auth=' .. csrf .. '&p_p_id=33_WAR_cored5portlet&p_p_lifecycle=1&p_p_state=normal&p_p_mode=view&p_p_col_id=column-1&p_p_col_count=1&_33_WAR_cored5portlet_javax.portlet.action=getLoginStatus',req_hdrs, post_data)
-		if cde ~= 302 then return '', '8', 'Incorrect response code ' .. cde .. ' expect 302' end
+		bdy,cde,hdrs,result = HttpsGet(hdrs.location,req_hdrs)
+		if cde ~= 302 then return '', '6.2', 'Incorrect response code ' .. cde .. ' expect 302' end
+		if not hdrs.location then return '', '6.3', 'Missing redirect location in return header' end
+		-- Step 6.2
+		log.Debug("Step 6.2")
+		req_hdrs = {
+			['host'] = sec_host,
+			['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+			['accept-encoding'] = 'gzip, deflate, br',
+			['user-agent'] = user_agent,
+			['referer'] = sf(URLS[4], sec_host, client_id),
+			['cookie'] = cookies_build(cookie_tab[sec_host], "SESSION/signin-service/v1/", "vcap_journey"),
+			['connection'] = 'keep-alive'
+		}
+		bdy,cde,hdrs,result = HttpsGet(hdrs.location,req_hdrs)
+		if cde ~= 302 then return '', '6.4', 'Incorrect response code ' .. cde .. ' expect 302' end
+		if not hdrs.location then return '', '6.5', 'Missing redirect location in return header' end
+		-- Step 6.3
+		log.Debug("Step 6.3")
+		req_hdrs = {
+			['host'] = sec_host,
+			['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+			['accept-encoding'] = 'gzip, deflate, br',
+			['user-agent'] = user_agent,
+			['referer'] = sf(URLS[4], sec_host, client_id),
+			['cookie'] = cookies_build(cookie_tab[sec_host], "JSESSIONID/oidc", "__VCAP_ID__/oidc", "vcap_journey"),
+			['connection'] = 'keep-alive'
+		}
+		bdy,cde,hdrs,result = HttpsGet(hdrs.location,req_hdrs)
+		if cde ~= 302 then return '', '6.7', 'Incorrect response code ' .. cde .. ' expect 302' end
+		local login_complete_url = hdrs.location or ''
+		if login_complete_url == '' then return '', '6.8', 'Missing redirect location in return header' end
 		if (hdrs and hdrs['set-cookie']) then 
-			cookie_JS = string.match(hdrs['set-cookie'],'JSESSIONID=([%w%.]+); Path=')
+			cookies_parse(cookie_tab[req_hdrs['host']], hdrs['set-cookie'])
 		end
-		if not cookie_JS then return '', '8.1', 'Missing JSESSIONID in return set-cookie' end
-		ref_url3 = hdrs.location
-		if not ref_url3 then return '', '8.2', 'Missing redirect location in return header' end
+		-- Step 6.4
+		log.Debug("Step 6.4")
+		req_hdrs = {
+			['host'] = port_host,
+			['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+			['accept-encoding'] = 'gzip, deflate, br',
+			['user-agent'] = user_agent,
+			['referer'] = sf(URLS[4], sec_host, client_id),
+			['cookie'] = cookies_build(cookie_tab[port_host],"JSESSIONID", "LB-ID", "GUEST_LANGUAGE_ID", "COOKIE_SUPPORT", "CARNET_LANGUAGE_ID"),
+			['connection'] = 'keep-alive'
+		}
+		local query = extract_url_parameters(login_complete_url)
+		bdy,cde,hdrs,result = HttpsGet(login_complete_url,req_hdrs)
+		if cde ~= 200 then return '', '6.7', 'Incorrect response code ' .. cde .. ' expect 200' end
+		local portlet_code = query.code
+		local state = query.state
+		if not portlet_code then return '', '6.8', 'Missing portlet_code' end
+		if not state then return '', '6.8', 'Missing state' end
 
+		-- Step 7 
+		-- Complete last login step by posting portlet
+		log.Debug("Step 7 ===========")
+		req_hdrs = {
+			['host'] = port_host,
+			['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+			['accept-encoding'] = 'gzip, deflate, br',
+			['user-agent'] = user_agent,
+			['referer'] = login_complete_url,
+			['cookie'] = cookies_build(cookie_tab[port_host],"JSESSIONID", "LB-ID", "GUEST_LANGUAGE_ID", "COOKIE_SUPPORT", "CARNET_LANGUAGE_ID"),
+			['connection'] = 'keep-alive'
+		}
+		post_data = { 
+			{'_33_WAR_cored5portlet_code', portlet_code }
+		}
+		local final_login_url = sf(URLS[6], port_host, state)
+		bdy,cde,hdrs,result = HttpsPost(final_login_url,req_hdrs, post_data)
+		if cde ~= 302 then return '', '7', 'Incorrect response code ' .. cde .. ' expect 302' end
+		if (hdrs and hdrs['set-cookie']) then 
+			cookies_parse(cookie_tab[req_hdrs['host']], hdrs['set-cookie'])
+		end
+		if cookies_get(cookie_tab[req_hdrs['host']], "JSESSIONID") == '' then return '', '7.1', 'Missing JSESSIONID in return set-cookie' end
+		local base_json_url = hdrs.location
+		if not base_json_url then return '', '7.2', 'Missing redirect location in return header' end
+
+		-- Step 8
 		-- Go to home page or get command on reconnect
-		req_hdrs = header_clone(AUTHHEADERS)
-		req_hdrs['referer'] = ref_url2
-		req_hdrs['cookie'] = 'JSESSIONID='.. cookie_JS ..'; GUEST_LANGUAGE_ID='..isoLC..'; COOKIE_SUPPORT=true; CARNET_LANGUAGE_ID='..isoLC
-		bdy,cde,hdrs,result = HttpsGet(ref_url3,req_hdrs)
-		if cde ~= 200 then return '', '9', 'Incorrect response code ' .. cde .. ' expect 200' end
+		log.Debug("Step 8 ===========")
+		req_hdrs = {
+			['host'] = port_host,
+			['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+			['accept-encoding'] = 'identity',
+			['user-agent'] = user_agent,
+			['referer'] = login_complete_url,
+			['cookie'] = cookies_build(cookie_tab[port_host],"JSESSIONID", "LB-ID", "GUEST_LANGUAGE_ID", "COOKIE_SUPPORT", "CARNET_LANGUAGE_ID"),
+			['connection'] = 'keep-alive'
+		}
+		bdy,cde,hdrs,result = HttpsGet(base_json_url,req_hdrs)
+		if cde ~= 200 then return '', '8', 'Incorrect response code ' .. cde .. ' expect 200' end
 	
 		--We have a new CSRF
-		csrf = string.match(result[1],'<meta name="_csrf" content="(%w+)"/>')
+		csrf = sm(result[1],'<meta name="_csrf" content="(%w+)"/>')
+		if not csrf then return '', '8.1', 'No CSRF token found' end
 		-- done!!!! we are in at last
-		log.Debug('Login done. Token : '..csrf)	
-		return ref_url3, csrf, cookie_JS
+		log.Debug('Login done. X-CSRF Token : %s', csrf)	
+		return base_json_url, csrf, cookies_build(cookie_tab[port_host],"JSESSIONID", "LB-ID", "GUEST_LANGUAGE_ID", "COOKIE_SUPPORT", "CARNET_LANGUAGE_ID")
 	end
 	
 	-- Get string of supported languages
@@ -563,28 +844,32 @@ log.Debug("HttpsPost 3 "..cde)
 	end
 	
 	-- Send a command to the portal, calling routines must assure initial login has happened.
-	local function _sendcommand(command, token, sessionid, base_url)
+	local function _sendcommand(command, token, cookies, base_url)
 		log.Debug('Enter SendCommand :'.. command)
 		local cm_url = commands[command].url
 		local cm_data = commands[command].json
 		if cm_url then 
+			local tc = table.concat
 			local isoLC = _getlanguacode(cc)
-			local req_hdrs = HEADERS
-			req_hdrs['x-csrf-token'] = token
-			req_hdrs['origin'] = 'https://'..port_host
-			req_hdrs['referer'] = _url
-			req_hdrs['cookie'] = 'JSESSIONID='.. sessionid ..'; GUEST_LANGUAGE_ID='..isoLC..'; COOKIE_SUPPORT=true; CARNET_LANGUAGE_ID='..isoLC
-log.Debug('SendCommand Cookie 2 :'.. 'JSESSIONID='.. sessionid ..'; GUEST_LANGUAGE_ID='..isoLC..'; COOKIE_SUPPORT=true; CARNET_LANGUAGE_ID='..isoLC)
+			local req_hdrs = { 
+				['accept'] = 'application/json, text/plain, */*',
+				['content-type'] = 'application/json;charset=UTF-8',
+				['user-agent'] = user_agent,
+				['x-csrf-token'] = token,
+				['referer'] = base_url,
+				['cookie'] = cookies
+			}
+log.Debug('SendCommand Cookie 2 : %s',cookies)
 			
 			local bdy,cde,hdrs,result = HttpsPost(base_url..cm_url,req_hdrs,cm_data)
-log.Debug('SendCommand res :'..cde)
+log.Debug('SendCommand res : %d',cde)
 			-- We have a redirect because session expired, so tell caller to login again
 			if cde == 302 then
 				return cde
 			elseif cde == 200 then
-				return cde, table.concat(result)
+				return cde, tc(result)
 			else
-				log.Log('Incorrect responce code '..cde,5)
+				log.Error('Incorrect responce code %s', cde)
 				return cde, _build_error_message(cde, "SEND_COMMAND","Could not send command","Invalid response code "..cde.." received. Expected 200 or 302.")
 			end
 		else
@@ -616,6 +901,7 @@ function CarNetModule()
 		var.Default("userURL")
 		var.Default("Token")
 		var.Default("SessionID")
+		var.Default("Cookies")
 		var.Default("Language", "GB")
 		var.Default("PollSettings", '5,60,120,15,1440') -- Active, Home Idle, Away Idle, FastPoll, Vacation location
 		var.Default("LocationHome","0")
@@ -681,14 +967,14 @@ function CarNetModule()
 		local password = var.Get('Password')
 		local cc = var.Get('Language')
 		if email ~= '' and password ~= '' and cc ~= '' then
-			local userURL,token,sessionid = myCarNet.PortalLogin(email, password, cc)
+			local userURL,token,cookies = myCarNet.PortalLogin(email, password, cc)
 			if userURL ~= '' then
-				SetSessionDetails(userURL, token, sessionid)
+				SetSessionDetails(userURL, token, cookies)
 				var.Set('LastLogin', os.time())
-				return 200, userURL, token, sessionid
+				return 200, userURL, token, cookies
 			else
-				log.Log('Unable to login. errorCode : '..token..', errorMessage : '..sessionid ,3)
-				return 404, "PORTAL_LOGIN","Login to CarNet Portal failed "..token,sessionid
+				log.Error('Unable to login. errorCode : %s, errorMessage : %s', token, cookies)
+				return 404, "PORTAL_LOGIN","Login to CarNet Portal failed "..token..cookies
 			end
 		else
 			log.Log('Configration not complete',5)
@@ -697,31 +983,31 @@ function CarNetModule()
 	end
 	
 	local function _command(command)
-		local userURL, token, sessionid = GetSessionDetails()
+		local userURL, token, cookies = GetSessionDetails()
 		local cde
-		if userURL == '' or token == '' or sesionid == '' then
+		if userURL == '' or token == '' or cookies == '' then
 			-- We need to login first.
 			log.Debug('No session yet, need to login')
-			cde, userURL, token, sessionid = _login()
+			cde, userURL, token, cookies = _login()
 			if cde ~= 200 then
-				return cde, myCarNet.BuildErrorMessage(cde, userURL, token, sessionid)
+				return cde, myCarNet.BuildErrorMessage(cde, userURL, token, cookies)
 			end	
 		end	
-		log.Debug('Sending command : '..command)
-		local cde, res = myCarNet.SendCommand(command, token, sessionid, userURL)
+		log.Debug('Sending command : %s', command)
+		local cde, res = myCarNet.SendCommand(command, token, cookies, userURL)
 		if cde == 200 then
-			log.Log('Command result : Code ; '..cde..', Response ; '.. string.sub(res,1,30))
+			log.Log('Command result : Code ; %s, Response ; %s',cde, string.sub(res,1,30))
 			log.Debug(res)	
 			return cde, res
 		elseif cde == 302 then
 			-- Session expired. We need to login again
 			log.Debug('Session exipred, need to login')
-			cde, userURL, token, sessionid = _login()
+			cde, userURL, token, cookies = _login()
 			if cde ~= 200 then
-				return cde, myCarNet.BuildErrorMessage(cde, userURL, token, sessionid)
+				return cde, myCarNet.BuildErrorMessage(cde, userURL, token, cookies)
 			else	
-				cde, res = myCarNet.SendCommand(command, token, sessionid, userURL)
-				log.Log('Command result : Code ; '..cde..', Response ; '.. string.sub(res,1,30))
+				cde, res = myCarNet.SendCommand(command, token, cookies, userURL)
+				log.Log('Command result : Code ; %s, Response ; %s', cde, string.sub(res,1,30))
 				log.Debug(res)	
 				return cde, res
 			end	
@@ -745,6 +1031,7 @@ function CarNetModule()
 		local deb_res = ""
 		
 		local function buildStatusText(item, drs, lckd)
+			local tc = table.concat
 			local txt_t = {}
 			if item.left_front ~= lckd then txt_t[#txt_t+1] = 'Left front' end
 			if item.right_front ~= lckd then txt_t[#txt_t+1] = 'Right front' end
@@ -756,9 +1043,9 @@ function CarNetModule()
 			if #txt_t == 0 then
 				return nil
 			elseif #txt_t == 1 then
-				return table.concat(txt_t, ', ')..' is '
+				return tc(txt_t, ', ')..' is '
 			elseif #txt_t < drs then
-				return table.concat(txt_t, ', ')..' are '
+				return tc(txt_t, ', ')..' are '
 			else	
 				return 'All are '
 			end
@@ -766,7 +1053,7 @@ function CarNetModule()
 		
 		local cde, res = _command('getVsr')
 		if cde == 200 then
-			log.Debug('getVsr result : '..res)
+			log.Debug('getVsr result : %s', res)
 			local rjs = json.decode(res) 
 			if rjs.errorCode == '0' then 
 				if rjs.vehicleStatusData then
@@ -821,10 +1108,9 @@ function CarNetModule()
 							end
 						end	
 					end
-					-- V2.3, VW changed logic to match other items.
-					-- Locks status 2 should be locked, 3 unlocked
+					-- Locks status 3 should be locked, 2 unlocked
 					if vsd.lockData then
-						local txt = buildStatusText(vsd.lockData, n_doors, 2)
+						local txt =	buildStatusText(vsd.lockData, n_doors, 2)
 						if txt then
 							var.Set('LocksStatus', txt..'unlocked')
 							var.Set('IconSet',3)
@@ -863,7 +1149,7 @@ function CarNetModule()
 		local deb_res = ""
 		local cde, res = _command('getLocation')
 		if cde == 200 then
-			log.Debug('getLocation result : '..res)
+			log.Debug('getLocation result : %s', res)
 			local rjs = json.decode(res)
 			if rjs.errorCode == "0" then
 				if rjs.position then
@@ -900,7 +1186,7 @@ function CarNetModule()
 		local deb_res = ""
 		local cde, res = _command('getVehicleDetails')
 		if cde == 200 then
-			log.Debug('getVehicleDetails result : '..res)
+			log.Debug('getVehicleDetails result : %s', res)
 			local rjs = json.decode(res)
 			if rjs.errorCode == "0" then
 				if rjs.vehicleDetails then
@@ -936,7 +1222,7 @@ function CarNetModule()
 		local rem_time = 0
 		local cde, res = _command('getEManager')
 		if cde == 200 then
-			log.Debug('getEManager result : '..res)
+			log.Debug('getEManager result : %s', res)
 			local rjs = json.decode(res)
 			if rjs.errorCode == "0" then
 				if rjs.EManager then
@@ -1026,7 +1312,7 @@ function CarNetModule()
 		local deb_res = ""
 		local cde, res = _command('getFullyLoadedCars')
 		if cde == 200 then
-			log.Debug('getFullyLoadedCars result : '..res)
+			log.Debug('getFullyLoadedCars result : %s', res)
 			local rjs = json.decode(res)
 			if rjs.errorCode == "0" then
 				if rjs.fullyLoadedVehiclesResponse then
@@ -1078,10 +1364,11 @@ function CarNetModule()
 		local poll_end, poll_start = 0,0
 		local noptw = var.Get("NoPollWindow")
 		if noptw ~= '' then
-			local st, et = string.match(noptw,"(.-)\-(.+)")
-			local hS, mS = string.match(st,"(%d+):(%d+)")
+			local sm = string.match
+			local st, et = sm(noptw,"(.-)\-(.+)")
+			local hS, mS = sm(st,"(%d+):(%d+)")
 			local mStart = (hS * 60) + mS
-			local hE, mE = string.match(et,"(%d+):(%d+)")
+			local hE, mE = sm(et,"(%d+):(%d+)")
 			local mEnd = (hE * 60) + mE
 			local tNow = os.date("*t")
 			local mNow = (tNow.hour * 60) + tNow.min
@@ -1167,15 +1454,15 @@ function CarNetModule()
 		if (poll_start ~= 0 and poll_end ~= 0 and next_poll > poll_end) then next_poll = poll_start end
 		if (next_poll < 0) then next_poll = next_poll + 86400 end
 		if (next_poll == 0) then next_poll = 3600 end
-		log.Debug("Next poll time in "..next_poll .. " seconds.")
+		log.Debug("Next poll time in %d seconds.", next_poll)
 		return next_poll
 	end
 			
 	-- Trigger an update of the car status by sending RequestVsr now. Polling will pickup on update.
 	local function _poll()
 		log.Debug("Poll, enter")
-		_command('getRequestVsr')
---		CarNet_UpdateStatus('loop', true)
+--		_command('getRequestVsr')
+		CarNet_UpdateStatus('loop', true)
 	end
 	
 	local function _start_action(request)
@@ -1236,7 +1523,7 @@ function CarNet_UpdateStatus()
 			log.Debug('getFullyLoadedCars succeeded')
 			var.Set('LastFLCPoll', os.time())
 		else	
-			log.Debug('getFullyLoadedCars error : '..deb_res)
+			log.Debug('getFullyLoadedCars error : %s', deb_res)
 		end
 	end	
 	if deb_res == "" then
@@ -1246,7 +1533,7 @@ function CarNet_UpdateStatus()
 		if stat then
 			log.Debug('RequestStatus succeeded')
 		else	
-			log.Debug('RequestStatus error : '..deb_res)
+			log.Debug('RequestStatus error : %s', deb_res)
 		end
 	end
 					
@@ -1256,7 +1543,7 @@ function CarNet_UpdateStatus()
 		if stat then
 			log.Debug('UpdateCarLocation succeeded')
 		else	
-			log.Debug('UpdateCarLocation error : '..deb_res)
+			log.Debug('UpdateCarLocation error : %s', deb_res)
 		end
 	end
 
@@ -1266,7 +1553,7 @@ function CarNet_UpdateStatus()
 		if stat then
 			log.Debug('UpdateVehicleDetails succeeded')
 		else	
-			log.Debug('UpdateVehicleDetails error : '..deb_res)
+			log.Debug('UpdateVehicleDetails error : %s', deb_res)
 		end
 	end
 
@@ -1277,7 +1564,7 @@ function CarNet_UpdateStatus()
 			if stat then
 				log.Debug('UpdateCarEManager succeeded')
 			else	
-				log.Debug('UpdateCarEManager error : '..deb_res)
+				log.Debug('UpdateCarEManager error : %s', deb_res)
 			end
 		end
 	end
@@ -1287,7 +1574,7 @@ function CarNet_UpdateStatus()
 		var.Set("PollNoReply", pc, pD.SIDS.ZW)
 		var.Set('StatusText',deb_res:sub(1,80))
 		log.Debug(deb_res)
-		log.Log(deb_res,5)
+		log.Info(deb_res)
 		myModule.SetStatusMessage()
 	else
 		var.Set('StatusText','Update Car Status complete.')
@@ -1517,9 +1804,10 @@ function CarNetModule_Initialize()
 	log = logAPI()
 	var = varAPI()
 	var.Initialize(pD.SIDS.MODULE, pD.DEV)
-	log.Initialize(pD.Description, var.GetNumber("LogLevel"))
+	log.Initialize(pD.Description, var.GetNumber("LogLevel"), true)
 
 	log.Log("device #" .. pD.DEV .. " is initializing!",3)
+
 	-- See if we are running on openLuup. If not stop.
 	if (luup.version_major == 7) and (luup.version_minor == 0) then
 		pD.onOpenLuup = true
